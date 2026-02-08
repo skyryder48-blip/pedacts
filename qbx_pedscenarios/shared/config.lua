@@ -952,4 +952,52 @@ Config.VehicleBuyerDefaults = {
     enabled = true,
 }
 
+-- ============================================================================
+-- FREE-GANGS INTEGRATION
+-- Awards gang reputation when players complete drug sales or security loot.
+-- Requires the 'free-gangs' resource to be running; gracefully no-ops if absent.
+-- ============================================================================
+
+Config.GangIntegration = {
+    enabled = true, -- master toggle; set false to disable all free-gangs hooks
+
+    --- Rep awarded on a successful foot-buyer drug sale
+    drugSale = {
+        masterRep = 2,            -- gang-wide reputation per sale
+        individualRep = 1,        -- player-specific reputation per sale
+        bulkBonusPerUnit = 0.5,   -- extra masterRep per unit above 1
+        zoneLoyalty = 0.3,        -- free-gangs territory influence per sale
+    },
+
+    --- Rep awarded on a successful vehicle-buyer drug sale
+    vehicleSale = {
+        masterRep = 5,            -- higher reward for riskier vehicle deals
+        individualRep = 3,
+        bulkBonusPerUnit = 0.3,
+        zoneLoyalty = 0.5,
+    },
+
+    --- Rep awarded when purchasing wholesale from a supplier vehicle
+    supplierPurchase = {
+        masterRep = 1,
+        individualRep = 1,
+        zoneLoyalty = 0.1,
+    },
+
+    --- Rep awarded when completing a security-zone objective (heist loot)
+    securityLoot = {
+        masterRep = 4,
+        individualRep = 3,
+        zoneLoyalty = 0.0,        -- security zones don't map to gang territories
+    },
+
+    --- Map pedscenarios drug zone IDs → free-gangs territory zone names.
+    --- If a mapping exists, zone loyalty is also awarded via AddZoneLoyalty.
+    --- Leave empty or comment out entries if your territories don't overlap.
+    zoneMapping = {
+        -- grove_street = 'grove_territory',
+        -- strawberry_ave = 'strawberry_territory',
+    },
+}
+
 return Config

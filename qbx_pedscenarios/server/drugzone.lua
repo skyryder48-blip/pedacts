@@ -44,6 +44,59 @@ local dirtyRep = {}
 local dirtyHeat = {}
 
 -- ============================================================================
+-- FREE-GANGS INTEGRATION
+-- ============================================================================
+
+--- Check if the free-gangs resource is running
+---@return boolean
+local function isFreeGangsActive()
+    if not Config.GangIntegration or not Config.GangIntegration.enabled then return false end
+    return GetResourceState('free-gangs') == 'started'
+end
+
+--- Award gang reputation for an activity. Gracefully no-ops if free-gangs is absent.
+---@param source integer Player server id
+---@param zoneId string Drug zone id (for zone loyalty mapping)
+---@param repConfig table Config entry (e.g. Config.GangIntegration.drugSale)
+---@param quantity integer Number of units in the transaction
+local function awardGangRep(source, zoneId, repConfig, quantity)
+    if not isFreeGangsActive() then return end
+
+    local gangData = exports['free-gangs']:GetPlayerGang(source)
+    if not gangData or not gangData.name then return end
+
+    local gangName = gangData.name
+
+    -- Master rep (gang-wide)
+    local masterAmount = repConfig.masterRep or 0
+    if repConfig.bulkBonusPerUnit and quantity > 1 then
+        masterAmount = masterAmount + math.floor((quantity - 1) * repConfig.bulkBonusPerUnit)
+    end
+    if masterAmount > 0 then
+        exports['free-gangs']:AddMasterRep(gangName, masterAmount, 'DrugSale')
+    end
+
+    -- Individual rep (player-specific)
+    local indivAmount = repConfig.individualRep or 0
+    if indivAmount > 0 then
+        exports['free-gangs']:AddIndividualRep(source, indivAmount, 'DrugSale')
+    end
+
+    -- Zone loyalty (territory influence)
+    local loyalty = repConfig.zoneLoyalty or 0
+    if loyalty > 0 then
+        local mapping = Config.GangIntegration.zoneMapping
+        local territoryZone = mapping and mapping[zoneId]
+        if territoryZone then
+            exports['free-gangs']:AddZoneLoyalty(territoryZone, gangName, loyalty * quantity)
+        end
+    end
+
+    lib.print.info(('free-gangs: Awarded %s masterRep=%d indivRep=%d for zone "%s"'):format(
+        gangName, masterAmount, indivAmount, zoneId))
+end
+
+-- ============================================================================
 -- CITIZENID HELPERS
 -- ============================================================================
 
@@ -791,6 +844,15 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
     local newRep = getRep(source, session.zoneId)
     local newHeat = getHeat(session.zoneId)
 
+    -- Award free-gangs reputation
+    local isVehicleSale = archetypeId and archetypeId:find('^vehicle_') ~= nil
+    local gangRepConfig = isVehicleSale
+        and Config.GangIntegration and Config.GangIntegration.vehicleSale
+        or Config.GangIntegration and Config.GangIntegration.drugSale
+    if gangRepConfig then
+        awardGangRep(source, session.zoneId, gangRepConfig, session.quantity)
+    end
+
     lib.print.info(('Player %s sold %dx %s for $%d in zone "%s" | Rep: %.0f | Heat: %.1f'):format(
         source, session.quantity, session.itemName, finalPrice, session.zoneId, newRep, newHeat
     ))
@@ -1011,6 +1073,11 @@ lib.callback.register('qbx_pedscenarios:server:processSupplierSale', function(so
     -- Adds heat because a transaction occurred
     local heatGain = (itemDef.heatPerSale or 1.0) * quantity * 0.5
     addHeat(zoneId, heatGain)
+
+    -- Award free-gangs reputation for supplier purchase
+    if Config.GangIntegration and Config.GangIntegration.supplierPurchase then
+        awardGangRep(source, zoneId, Config.GangIntegration.supplierPurchase, quantity)
+    end
 
     lib.print.info(('Player %s bought %dx %s from supplier for $%d'):format(
         source, quantity, itemName, totalPrice))

@@ -11,6 +11,42 @@
 local objectiveCooldowns = {}
 
 -- ============================================================================
+-- FREE-GANGS INTEGRATION
+-- ============================================================================
+
+--- Check if the free-gangs resource is running
+---@return boolean
+local function isFreeGangsActive()
+    if not Config.GangIntegration or not Config.GangIntegration.enabled then return false end
+    return GetResourceState('free-gangs') == 'started'
+end
+
+--- Award gang reputation for completing a security zone objective
+---@param source integer
+local function awardSecurityGangRep(source)
+    if not isFreeGangsActive() then return end
+
+    local repConfig = Config.GangIntegration.securityLoot
+    if not repConfig then return end
+
+    local gangData = exports['free-gangs']:GetPlayerGang(source)
+    if not gangData or not gangData.name then return end
+
+    local gangName = gangData.name
+
+    if (repConfig.masterRep or 0) > 0 then
+        exports['free-gangs']:AddMasterRep(gangName, repConfig.masterRep, 'SecurityLoot')
+    end
+
+    if (repConfig.individualRep or 0) > 0 then
+        exports['free-gangs']:AddIndividualRep(source, repConfig.individualRep, 'SecurityLoot')
+    end
+
+    lib.print.info(('free-gangs: Awarded %s masterRep=%d indivRep=%d for security loot'):format(
+        gangName, repConfig.masterRep or 0, repConfig.individualRep or 0))
+end
+
+-- ============================================================================
 -- HELPERS
 -- ============================================================================
 
@@ -115,6 +151,11 @@ lib.callback.register('qbx_pedscenarios:server:attemptObjective', function(sourc
     -- Set cooldown
     if not objectiveCooldowns[citizenid] then objectiveCooldowns[citizenid] = {} end
     objectiveCooldowns[citizenid][objectiveId] = os.time() + math.floor(objDef.cooldownMs / 1000)
+
+    -- Award free-gangs reputation for completing objective
+    if #givenItems > 0 then
+        awardSecurityGangRep(source)
+    end
 
     lib.print.info(('Player %s (%s) completed objective "%s", received %d items'):format(
         source, citizenid, objectiveId, #givenItems))

@@ -36,3 +36,6 @@ dependencies {
     'qbx_core',
     'ox_inventory',
 }
+
+-- Optional: If 'free-gangs' is running, drug sales and security loot
+-- automatically award gang reputation. See Config.GangIntegration.
