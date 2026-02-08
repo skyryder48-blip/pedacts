@@ -98,7 +98,7 @@ Config.BuyerArchetypes = {
             `a_f_y_rurmeth_01`,
             `a_m_y_rurmeth_01`,
             `a_m_m_stlat_02`,
-            `a_f_m_tramp_01`,
+            `a_f_y_tramp_01`,
         },
         baseWeight = 40,
         minReputation = 0,
@@ -467,7 +467,7 @@ Config.DrugZones = {
         interactRadius = 2.0,
         spawnRadius = 25.0,
         cooldownPerPedMs = 20000,
-        items = { 'water', 'coke_brick', 'crack' },
+        items = { 'weed_brick', 'coke_brick', 'crack' },
         --- Curated spawn points: alleys, behind dumpsters, near walls.
         --- If this table is populated, peds prefer these over random scatter.
         --- Format: vec4(x, y, z, heading)

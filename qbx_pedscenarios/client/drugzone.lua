@@ -547,7 +547,7 @@ local function spawnBuyer(zoneConfig)
     local leadPed = SpawnScenarioPed(modelHash, spawnPoint, spawnPoint.w, 0)
     if not leadPed then return end
 
-    SetPedRelationshipGroupHash(leadPed, `YOURFRIENDLYGROUP`)
+    SetPedRelationshipGroupHash(leadPed, `DRUGBUYER_GROUP`)
 
     -- Spawn group members
     local groupPeds = {}
@@ -560,7 +560,7 @@ local function spawnBuyer(zoneConfig)
 
             local gPed = SpawnScenarioPed(PickRandom(archetype.pedModels), vec3(gx, gy, spawnPoint.z), spawnPoint.w, 0)
             if gPed then
-                SetPedRelationshipGroupHash(gPed, `YOURFRIENDLYGROUP`)
+                SetPedRelationshipGroupHash(gPed, `DRUGBUYER_GROUP`)
                 taskIdleScenario(gPed, archetype)
                 groupPeds[#groupPeds + 1] = gPed
             end
