@@ -1,13 +1,19 @@
---- Security Zone Scenario — Enhanced
+--- Security Zone Scenario — Enhanced v2
 --- Full-featured security zone system with:
 --- • Alert level state machine (patrol → suspicious → alert → combat)
 --- • Stealth detection (crouch, cover, noise, time-of-day)
 --- • Guard archetypes (rent-a-cop, private security, PMC, elite)
 --- • Guard communication with radio propagation delay
---- • Reinforcement waves on combat trigger
+--- • Reinforcement waves on combat trigger (+ continuous waves)
 --- • Access systems (disguises, keycards, vehicles)
 --- • Guard routines (scenario sequences between patrols)
---- • Lootable objectives (safes, computers) with ox_target + server validation
+--- • Multi-step objectives with equipment tiers and noise events
+--- • Guard tactical behaviors (cover, flanking, suppressive fire, pursuit)
+--- • Guard shift variations (time-of-day archetype/count changes)
+--- • Guard morale system (flee/retreat on low morale)
+--- • Objective state persistence and guard discovery
+--- • Debug visualization (detection cones, suspicion bars, morale, waypoints)
+--- • Animation/prop cleanup on interrupt (death, ragdoll, taser)
 
 local secZones = {}             ---@type table<string, CZone>
 local secZoneActive = {}        ---@type table<string, boolean>
@@ -20,6 +26,12 @@ local reinforcementsActive = {} ---@type table<string, boolean> -- zoneId -> pos
 local playerAccess = {}         ---@type table<string, {type: string, expiry: integer}> -- zoneId -> access grant
 local keycardCache = {}         ---@type table<string, {result: boolean, expiry: integer}> -- zoneId -> cached check
 local deadPostGuards = {}       ---@type table<string, table[]> -- zoneId -> dead post guard info for respawn
+
+-- New state tables
+local objectiveOpenStates = {} ---@type table<string, table<string, boolean>> -- zoneId -> { stepId = true }
+local activeZoneEffects = {}   ---@type table<string, table> -- zoneId -> { detectionMultiplier, reinforcementDelay, ... }
+local pursuingGuards = {}      ---@type table<integer, { zoneId: string, lastLosTime: integer, losTimeout: integer }> -- ped -> pursuit state
+local activeInteractionCleanup = nil ---@type function? -- cleanup callback for current interaction
 
 local interactWithObjective     -- forward declaration (defined after initObjectives)
 
@@ -39,6 +51,9 @@ local interactWithObjective     -- forward declaration (defined after initObject
 ---@field deathPos? vector3 -- where the guard died (for body discovery)
 ---@field bodyDiscovered? boolean -- has another guard found this body
 ---@field postConfig? table -- original post config entry (for respawn)
+---@field morale number -- current morale (starts at Config.GuardMorale.base)
+---@field wounded boolean -- has this guard been wounded below retreat threshold
+---@field fleeing boolean -- is this guard fleeing due to morale
 
 ---@class ZoneAlertData
 ---@field level AlertLevel
@@ -46,6 +61,7 @@ local interactWithObjective     -- forward declaration (defined after initObject
 ---@field lastKnownPlayerPos vector3? -- where player was last spotted
 ---@field suspicionPool number -- aggregate zone-wide suspicion
 ---@field combatStartedAt integer? -- when combat began (for reinforcement timing)
+---@field continuousWaveCount integer? -- how many continuous waves have spawned
 
 -- ============================================================================
 -- ARCHETYPE LOOKUP
@@ -166,7 +182,7 @@ end
 -- ============================================================================
 
 --- Calculate the effective detection range for a guard against the player.
---- Factors: posture, movement, cover, time-of-day, alert level.
+--- Factors: posture, movement, cover, time-of-day, alert level, zone effects.
 ---@param guardPed integer
 ---@param baseRange number
 ---@param zoneId string
@@ -174,7 +190,13 @@ end
 local function calculateDetectionRange(guardPed, baseRange, zoneId)
     if not Config.Stealth.enabled then
         local alertCfg = Config.AlertLevels[getAlertLevel(zoneId)]
-        return baseRange * (alertCfg and alertCfg.detectionMultiplier or 1.0)
+        local range = baseRange * (alertCfg and alertCfg.detectionMultiplier or 1.0)
+        -- Apply zone effects
+        local effects = activeZoneEffects[zoneId]
+        if effects and effects.detectionMultiplier then
+            range = range * effects.detectionMultiplier
+        end
+        return range
     end
 
     local mult = 1.0
@@ -207,6 +229,12 @@ local function calculateDetectionRange(guardPed, baseRange, zoneId)
     local alertCfg = Config.AlertLevels[getAlertLevel(zoneId)]
     if alertCfg then
         mult = mult * alertCfg.detectionMultiplier
+    end
+
+    -- Apply zone effects (e.g. from disabling cameras)
+    local effects = activeZoneEffects[zoneId]
+    if effects and effects.detectionMultiplier then
+        mult = mult * effects.detectionMultiplier
     end
 
     return baseRange * mult
@@ -251,6 +279,27 @@ local function checkNoiseEvents(zoneId, zoneConfig)
     end
 
     return false, nil
+end
+
+-- ============================================================================
+-- NOISE EVENT GENERATION (from objective step interactions)
+-- ============================================================================
+
+--- Generate a noise event at a position. Guards within radius are alerted.
+---@param zoneId string
+---@param pos vector3
+---@param radius number
+local function generateNoiseEvent(zoneId, pos, radius)
+    if radius <= 0 then return end
+
+    for ped, data in pairs(secGuards) do
+        if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
+            local dist = #(pos - GetEntityCoords(ped))
+            if dist < radius then
+                data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 2.0
+            end
+        end
+    end
 end
 
 -- ============================================================================
@@ -347,6 +396,163 @@ local function checkPlayerAccess(zoneId, zoneConfig)
 end
 
 -- ============================================================================
+-- GUARD SHIFT SYSTEM
+-- ============================================================================
+
+--- Determine the current shift for a zone based on game hour.
+---@param shifts table[]
+---@return table? shift -- the active shift entry, or nil if no match
+local function getCurrentShift(shifts)
+    if not shifts or #shifts == 0 then return nil end
+
+    local hour = GetClockHours()
+    for _, shift in ipairs(shifts) do
+        if shift.startHour < shift.endHour then
+            -- Same-day range (e.g. 6-18)
+            if hour >= shift.startHour and hour < shift.endHour then
+                return shift
+            end
+        else
+            -- Overnight range (e.g. 18-6)
+            if hour >= shift.startHour or hour < shift.endHour then
+                return shift
+            end
+        end
+    end
+
+    -- Fallback: return first shift
+    return shifts[1]
+end
+
+--- Apply post/patrol multiplier to determine if a given entry should spawn.
+--- multiplier < 1.0: random chance to skip (cull)
+--- multiplier > 1.0: spawn and possibly duplicate
+---@param multiplier number
+---@return integer count -- how many times to spawn (0 = skip, 1 = normal, 2+ = duplicate)
+local function applySpawnMultiplier(multiplier)
+    if multiplier <= 0 then return 0 end
+
+    local wholeCount = math.floor(multiplier)
+    local fractional = multiplier - wholeCount
+    if math.random() < fractional then
+        wholeCount = wholeCount + 1
+    end
+
+    return math.max(wholeCount, 0)
+end
+
+-- ============================================================================
+-- GUARD MORALE HELPERS
+-- ============================================================================
+
+--- Check if an archetype is immune to morale
+---@param archetypeId string
+---@return boolean
+local function isMoraleImmune(archetypeId)
+    if not Config.GuardMorale or not Config.GuardMorale.enabled then return true end
+    if not Config.GuardMorale.immuneArchetypes then return false end
+
+    for _, id in ipairs(Config.GuardMorale.immuneArchetypes) do
+        if id == archetypeId then return true end
+    end
+    return false
+end
+
+--- Count alive and dead guards in a zone
+---@param zoneId string
+---@return integer alive, integer dead
+local function countGuards(zoneId)
+    local alive, dead = 0, 0
+    for _, data in pairs(secGuards) do
+        if data.zoneId == zoneId then
+            if data.alive then
+                alive = alive + 1
+            else
+                dead = dead + 1
+            end
+        end
+    end
+    return alive, dead
+end
+
+--- Update morale for a single guard based on zone events
+---@param ped integer
+---@param data GuardData
+---@param zoneId string
+local function updateGuardMorale(ped, data, zoneId)
+    if not Config.GuardMorale or not Config.GuardMorale.enabled then return end
+    if isMoraleImmune(data.archetypeId) then return end
+    if not data.alive or not DoesEntityExist(ped) then return end
+
+    local cfg = Config.GuardMorale
+    local _, deadCount = countGuards(zoneId)
+
+    -- Dead colleague penalty
+    local targetMorale = cfg.base - (deadCount * cfg.deadColleaguePenalty)
+
+    -- Gunshot penalty: if player is shooting nearby
+    if IsPedShooting(cache.ped) then
+        local dist = #(GetEntityCoords(cache.ped) - GetEntityCoords(ped))
+        if dist < 50.0 then
+            data.morale = data.morale - cfg.gunshotPenalty * 0.1 -- applied per tick
+        end
+    end
+
+    -- Wounded penalty: if guard has taken damage
+    local maxHp = GetEntityMaxHealth(ped)
+    local curHp = GetEntityHealth(ped)
+    if maxHp > 0 and curHp < maxHp * 0.7 then
+        targetMorale = targetMorale - cfg.woundedPenalty
+    end
+
+    -- Player hit boost: if guard damaged the player
+    if HasEntityBeenDamagedByEntity(cache.ped, ped, true) then
+        targetMorale = targetMorale + cfg.playerHitBoost
+    end
+
+    -- Lerp morale toward target
+    targetMorale = math.max(0, math.min(cfg.base, targetMorale))
+    data.morale = data.morale + (targetMorale - data.morale) * 0.1
+
+    -- Apply morale effects
+    if data.morale <= cfg.fleeThreshold and not data.fleeing then
+        data.fleeing = true
+        ClearPedTasks(ped)
+        TaskSmartFleePed(ped, cache.ped, 200.0, -1, false, false)
+        SetPedKeepTask(ped, true)
+        lib.print.info(('Guard %d fleeing (morale %.0f)'):format(ped, data.morale))
+    elseif data.morale <= cfg.retreatThreshold and not data.fleeing then
+        -- Retreat to nearest post position
+        local nearestPost = nil
+        local nearestDist = math.huge
+        local pedCoords = GetEntityCoords(ped)
+
+        -- Find the zone config to get post positions
+        for _, zoneCfg in ipairs(Config.SecurityZones) do
+            if zoneCfg.id == zoneId and zoneCfg.posts then
+                for _, post in ipairs(zoneCfg.posts) do
+                    local d = #(pedCoords - vec3(post.coords.x, post.coords.y, post.coords.z))
+                    if d < nearestDist then
+                        nearestDist = d
+                        nearestPost = post
+                    end
+                end
+                break
+            end
+        end
+
+        if nearestPost and not data.wounded then
+            data.wounded = true
+            ClearPedTasks(ped)
+            TaskGoStraightToCoord(ped, nearestPost.coords.x, nearestPost.coords.y, nearestPost.coords.z,
+                2.0, -1, nearestPost.coords.w, 1.0)
+            SetPedKeepTask(ped, true)
+            lib.print.info(('Guard %d retreating to post (morale %.0f)'):format(ped, data.morale))
+        end
+    end
+end
+
+-- ============================================================================
 -- GUARD SPAWNING
 -- ============================================================================
 
@@ -379,9 +585,10 @@ end
 ---@param post table
 ---@param zoneId string
 ---@param zoneConfig table
+---@param archetypeOverrideFromShift? string
 ---@return integer?
-local function spawnPostGuard(post, zoneId, zoneConfig)
-    local archetypeId = post.archetypeOverride or zoneConfig.defaultArchetype
+local function spawnPostGuard(post, zoneId, zoneConfig, archetypeOverrideFromShift)
+    local archetypeId = post.archetypeOverride or archetypeOverrideFromShift or zoneConfig.defaultArchetype
     local archetype = getArchetype(archetypeId)
     if not archetype then return nil end
 
@@ -404,6 +611,9 @@ local function spawnPostGuard(post, zoneId, zoneConfig)
         suspicion = 0,
         alerted = false,
         alive = true,
+        morale = Config.GuardMorale and Config.GuardMorale.base or 100,
+        wounded = false,
+        fleeing = false,
     }
 
     return ped
@@ -412,11 +622,12 @@ end
 ---@param patrol table
 ---@param zoneId string
 ---@param zoneConfig table
+---@param archetypeOverrideFromShift? string
 ---@return integer?
-local function spawnPatrolGuard(patrol, zoneId, zoneConfig)
+local function spawnPatrolGuard(patrol, zoneId, zoneConfig, archetypeOverrideFromShift)
     if #patrol.waypoints < 2 then return nil end
 
-    local archetypeId = patrol.archetypeOverride or zoneConfig.defaultArchetype
+    local archetypeId = patrol.archetypeOverride or archetypeOverrideFromShift or zoneConfig.defaultArchetype
     local archetype = getArchetype(archetypeId)
     if not archetype then return nil end
 
@@ -436,6 +647,9 @@ local function spawnPatrolGuard(patrol, zoneId, zoneConfig)
         suspicion = 0,
         alerted = false,
         alive = true,
+        morale = Config.GuardMorale and Config.GuardMorale.base or 100,
+        wounded = false,
+        fleeing = false,
     }
 
     -- Patrol loop with optional routine steps
@@ -444,6 +658,13 @@ local function spawnPatrolGuard(patrol, zoneId, zoneConfig)
         while DoesEntityExist(ped) and secZoneActive[zoneId] do
             local alert = getAlertLevel(zoneId)
             if alert == 'combat' or alert == 'alert' then
+                Wait(1000)
+                goto continue
+            end
+
+            -- Check if fleeing/retreating due to morale
+            local guardData = secGuards[ped]
+            if guardData and (guardData.fleeing or guardData.wounded) then
                 Wait(1000)
                 goto continue
             end
@@ -536,6 +757,9 @@ local function spawnReinforcementWave(wave, zoneId, zoneConfig)
                 suspicion = 100,
                 alerted = true,
                 alive = true,
+                morale = Config.GuardMorale and Config.GuardMorale.base or 100,
+                wounded = false,
+                fleeing = false,
             }
         end
     end
@@ -547,9 +771,38 @@ local function spawnReinforcementWave(wave, zoneId, zoneConfig)
     })
 end
 
+--- Spawn a continuous reinforcement wave (after all defined waves are used)
+---@param cfg table -- reinforcements config
+---@param zoneId string
+---@param zoneConfig table
+local function spawnContinuousWave(cfg, zoneId, zoneConfig)
+    local waveData = {
+        archetypeId = cfg.continuousArchetype or 'pmc',
+        count = cfg.continuousCount or 3,
+        spawnRadius = cfg.continuousSpawnRadius or 50.0,
+    }
+    spawnReinforcementWave(waveData, zoneId, zoneConfig)
+end
+
 -- ============================================================================
 -- GUARD BEHAVIOR PER ALERT LEVEL
 -- ============================================================================
+
+--- Get alive guards in a zone sorted by distance from a position
+---@param zoneId string
+---@param pos vector3
+---@return table[] -- array of { ped, data, dist }
+local function getAliveGuardsByDistance(zoneId, pos)
+    local guards = {}
+    for ped, data in pairs(secGuards) do
+        if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) and not data.fleeing then
+            local dist = #(pos - GetEntityCoords(ped))
+            guards[#guards + 1] = { ped = ped, data = data, dist = dist }
+        end
+    end
+    table.sort(guards, function(a, b) return a.dist < b.dist end)
+    return guards
+end
 
 --- Apply behavior changes to all zone guards based on current alert level
 ---@param zoneId string
@@ -565,6 +818,9 @@ local function applyAlertBehavior(zoneId, zoneConfig)
             end
             goto continue
         end
+
+        -- Skip guards that are fleeing due to morale
+        if data.fleeing then goto continue end
 
         if level == 'suspicious' then
             -- Investigating guard walks toward last known position
@@ -612,11 +868,39 @@ local function applyAlertBehavior(zoneId, zoneConfig)
                 SetRelationshipBetweenGroups(5, hostileGroup, `PLAYER`)
                 SetRelationshipBetweenGroups(5, `PLAYER`, hostileGroup)
                 SetPedRelationshipGroupHash(ped, hostileGroup)
-                TaskCombatPed(ped, cache.ped, 0, 16)
-                SetPedKeepTask(ped, true)
 
-                -- Check for flee behavior
                 local archetype = getArchetype(data.archetypeId)
+                local tactics = archetype and archetype.tactics or {}
+
+                -- Tactical behaviors
+                if tactics.suppressiveFire then
+                    -- Set combat attribute for suppressive fire (BF_CanFightArmedPedsWhenNotArmed)
+                    SetPedCombatAttributes(ped, 2, true)
+                    SetPedFiringPattern(ped, `FIRING_PATTERN_FULL_AUTO`)
+                end
+
+                if tactics.useCover then
+                    -- Use cover-based combat: go to combat area with tactical awareness
+                    local playerCoords = GetEntityCoords(cache.ped)
+                    SetPedCombatAttributes(ped, 1, true) -- BF_CanUseCover
+                    TaskGoToCoordAnyMeans(ped, playerCoords.x, playerCoords.y, playerCoords.z, 2.0, 0, false, 786603, 0.0)
+                    SetTimeout(1500, function()
+                        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) then
+                            TaskCombatPed(ped, cache.ped, 0, 16)
+                            SetPedKeepTask(ped, true)
+                        end
+                    end)
+                else
+                    TaskCombatPed(ped, cache.ped, 0, 16)
+                    SetPedKeepTask(ped, true)
+                end
+
+                -- Retreat threshold from tactics
+                if tactics.retreatThreshold then
+                    SetPedFleeAttributes(ped, 2, true)
+                end
+
+                -- Check for flee behavior from archetype
                 if archetype and archetype.fleeHealthThreshold then
                     SetPedFleeAttributes(ped, 2, true)
                 end
@@ -624,6 +908,50 @@ local function applyAlertBehavior(zoneId, zoneConfig)
         end
 
         ::continue::
+    end
+
+    -- Flanking behavior: when in combat with 2+ alive guards, pick furthest to flank
+    if level == 'combat' and state and state.lastKnownPlayerPos then
+        local playerCoords = GetEntityCoords(cache.ped)
+        local aliveGuards = getAliveGuardsByDistance(zoneId, playerCoords)
+
+        if #aliveGuards >= 2 then
+            -- The furthest guard attempts to flank
+            local flanker = aliveGuards[#aliveGuards]
+            local flankerArchetype = getArchetype(flanker.data.archetypeId)
+            local flankerTactics = flankerArchetype and flankerArchetype.tactics or {}
+
+            if flankerTactics.flanking and not flanker.data.fleeing then
+                -- Calculate a flanking position: perpendicular to approach vector
+                local guardPos = GetEntityCoords(flanker.ped)
+                local toPlayer = playerCoords - guardPos
+                local perpX = -toPlayer.y
+                local perpY = toPlayer.x
+                local perpLen = math.sqrt(perpX * perpX + perpY * perpY)
+                if perpLen > 0.01 then
+                    perpX = perpX / perpLen
+                    perpY = perpY / perpLen
+                end
+
+                local flankDist = 15.0
+                local side = math.random() > 0.5 and 1 or -1
+                local flankX = playerCoords.x + perpX * flankDist * side
+                local flankY = playerCoords.y + perpY * flankDist * side
+                local flankZ = playerCoords.z
+
+                ClearPedTasks(flanker.ped)
+                TaskGoToCoordAnyMeans(flanker.ped, flankX, flankY, flankZ, 3.0, 0, false, 786603, 0.0)
+                SetPedKeepTask(flanker.ped, true)
+
+                -- After reaching flank position, engage
+                SetTimeout(4000, function()
+                    if DoesEntityExist(flanker.ped) and not IsPedDeadOrDying(flanker.ped, true) then
+                        TaskCombatPed(flanker.ped, cache.ped, 0, 16)
+                        SetPedKeepTask(flanker.ped, true)
+                    end
+                end)
+            end
+        end
     end
 end
 
@@ -638,10 +966,38 @@ local function resetGuardAlerts(zoneId)
 end
 
 -- ============================================================================
--- OBJECTIVE INTERACTION
+-- OBJECTIVE INTERACTION (Multi-Step)
 -- ============================================================================
 
---- Spawn objective props and register ox_target interactions
+--- Normalize an objective definition: if no `steps` field exists, wrap the
+--- objective itself as a single step (backward compat).
+---@param objDef table
+---@return table[] steps
+local function getObjectiveSteps(objDef)
+    if objDef.steps and #objDef.steps > 0 then
+        return objDef.steps
+    end
+
+    -- Backward compat: wrap the objective as a single step
+    return {
+        {
+            id = objDef.id .. '_auto',
+            label = objDef.label,
+            icon = objDef.icon or 'fas fa-crosshairs',
+            equipmentTier = objDef.equipmentTier,
+            maxAlertLevel = objDef.maxAlertLevel,
+            interactDurationMs = objDef.interactDurationMs,
+            animDict = objDef.animDict,
+            animName = objDef.animName,
+            noiseRadius = objDef.noiseRadius or 0,
+            onSuccess = objDef.onSuccess,
+            onFail = objDef.onFail,
+            lootTable = objDef.lootTable,
+        },
+    }
+end
+
+--- Spawn objective props and register ox_target interactions (multi-step)
 ---@param zoneId string
 ---@param zoneConfig table
 local function initObjectives(zoneId, zoneConfig)
@@ -649,6 +1005,7 @@ local function initObjectives(zoneId, zoneConfig)
 
     zoneObjectiveProps[zoneId] = {}
     zoneTargetZones[zoneId] = {}
+    objectiveOpenStates[zoneId] = objectiveOpenStates[zoneId] or {}
 
     for _, obj in ipairs(zoneConfig.objectives) do
         -- Spawn prop if defined
@@ -665,32 +1022,44 @@ local function initObjectives(zoneId, zoneConfig)
             end
         end
 
-        -- Register ox_target zone for this objective
+        -- Get steps (with backward compat wrapping)
+        local steps = getObjectiveSteps(obj)
+
+        -- Register ox_target zone for this objective with per-step options
         if GetResourceState('ox_target') == 'started' then
+            local options = {}
+
+            for _, step in ipairs(steps) do
+                options[#options + 1] = {
+                    name = 'seczone_obj_' .. obj.id .. '_step_' .. step.id,
+                    icon = step.icon or 'fas fa-crosshairs',
+                    label = step.label,
+                    distance = 2.0,
+                    canInteract = function()
+                        -- Check if step already completed
+                        if objectiveOpenStates[zoneId] and objectiveOpenStates[zoneId][step.id] then
+                            return false
+                        end
+                        -- Check alert level
+                        if step.maxAlertLevel then
+                            local current = getAlertLevel(zoneId)
+                            if alertOrder(current) > alertOrder(step.maxAlertLevel) then
+                                return false
+                            end
+                        end
+                        return true
+                    end,
+                    onSelect = function()
+                        interactWithObjective(zoneId, obj, step, zoneConfig)
+                    end,
+                }
+            end
+
             local targetId = exports.ox_target:addSphereZone({
                 coords = vec3(obj.coords.x, obj.coords.y, obj.coords.z),
                 radius = 1.2,
                 debug = Config.Debug,
-                options = {
-                    {
-                        name = 'seczone_obj_' .. obj.id,
-                        icon = obj.icon,
-                        label = obj.label,
-                        distance = 2.0,
-                        canInteract = function()
-                            if obj.maxAlertLevel then
-                                local current = getAlertLevel(zoneId)
-                                if alertOrder(current) > alertOrder(obj.maxAlertLevel) then
-                                    return false
-                                end
-                            end
-                            return true
-                        end,
-                        onSelect = function()
-                            interactWithObjective(zoneId, obj)
-                        end,
-                    },
-                },
+                options = options,
             })
             if targetId then
                 zoneTargetZones[zoneId][#zoneTargetZones[zoneId] + 1] = targetId
@@ -699,26 +1068,30 @@ local function initObjectives(zoneId, zoneConfig)
     end
 end
 
---- Handle objective interaction: check, animate, reward
+--- Handle objective step interaction: check, animate, reward, noise
 ---@param zoneId string
----@param objDef table
-interactWithObjective = function(zoneId, objDef)
-    -- Check cooldown first
-    local cdCheck = lib.callback.await('qbx_pedscenarios:server:checkObjectiveCooldown', false, objDef.id)
-    if cdCheck and not cdCheck.available then
-        local mins = math.ceil((cdCheck.remainingMs or 0) / 60000)
-        lib.notify({
-            title = 'Locked',
-            description = ('On cooldown. Available in ~%d min.'):format(mins),
-            type = 'error',
-        })
-        return
+---@param objDef table -- the parent objective definition
+---@param stepDef table -- the specific step to interact with
+---@param zoneConfig table -- the zone configuration
+interactWithObjective = function(zoneId, objDef, stepDef, zoneConfig)
+    -- Check cooldown first (on parent objective)
+    if objDef.cooldownMs then
+        local cdCheck = lib.callback.await('qbx_pedscenarios:server:checkObjectiveCooldown', false, objDef.id)
+        if cdCheck and not cdCheck.available then
+            local mins = math.ceil((cdCheck.remainingMs or 0) / 60000)
+            lib.notify({
+                title = 'Locked',
+                description = ('On cooldown. Available in ~%d min.'):format(mins),
+                type = 'error',
+            })
+            return
+        end
     end
 
-    -- Check alert level
-    if objDef.maxAlertLevel then
+    -- Check alert level for this step
+    if stepDef.maxAlertLevel then
         local current = getAlertLevel(zoneId)
-        if alertOrder(current) > alertOrder(objDef.maxAlertLevel) then
+        if alertOrder(current) > alertOrder(stepDef.maxAlertLevel) then
             lib.notify({
                 title = 'Too Dangerous',
                 description = 'Can\'t do this while guards are on high alert!',
@@ -728,97 +1101,202 @@ interactWithObjective = function(zoneId, objDef)
         end
     end
 
-    -- Load animation if specified
-    if objDef.animDict then
-        lib.requestAnimDict(objDef.animDict)
-        TaskPlayAnim(cache.ped, objDef.animDict, objDef.animName, 8.0, -8.0, -1, 1, 0, false, false, false)
+    -- Request equipment tier info from server
+    local currentAlert = getAlertLevel(zoneId)
+    local tierResult = lib.callback.await('qbx_pedscenarios:server:attemptObjectiveStep', false,
+        zoneId, objDef.id, stepDef.id, currentAlert)
+
+    if not tierResult then
+        lib.notify({ title = stepDef.label, description = 'Failed — missing required equipment.', type = 'error' })
+        -- Apply onFail escalation
+        if stepDef.onFail and stepDef.onFail.escalation then
+            local newLevel = stepDef.onFail.escalation
+            if alertOrder(newLevel) > alertOrder(getAlertLevel(zoneId)) then
+                setAlertLevel(zoneId, newLevel, GetEntityCoords(cache.ped))
+                applyAlertBehavior(zoneId, zoneConfig)
+            end
+        end
+        return
     end
+
+    -- Handle server error responses
+    if tierResult.error then
+        if tierResult.error == 'cooldown' then
+            local mins = math.ceil((tierResult.remainingMs or 0) / 60000)
+            lib.notify({
+                title = 'Locked',
+                description = ('On cooldown. ~%d min remaining.'):format(mins),
+                type = 'error',
+            })
+            return
+        end
+
+        if tierResult.error == 'missing_equipment' or tierResult.error == 'missing_item' then
+            lib.notify({
+                title = stepDef.label,
+                description = ('You need equipment: %s'):format(tierResult.equipmentTier or stepDef.equipmentTier or 'unknown'),
+                type = 'error',
+            })
+            return
+        end
+
+        if tierResult.error == 'inventory_full' then
+            lib.notify({
+                title = stepDef.label,
+                description = 'Your inventory is full.',
+                type = 'error',
+            })
+            return
+        end
+
+        if tierResult.error == 'alert_too_high' then
+            lib.notify({
+                title = 'Too Dangerous',
+                description = 'Can\'t do this while guards are on high alert!',
+                type = 'error',
+            })
+            return
+        end
+
+        -- Generic error
+        lib.notify({ title = stepDef.label, description = tierResult.error, type = 'error' })
+        return
+    end
+
+    -- Apply equipment tier duration modifier
+    local equip = tierResult.equipment
+    local durationMult = (equip and equip.durationMult) or 1.0
+    local toolUsed = equip and equip.label
+    local noiseRadiusOverride = equip and equip.noiseRadiusOverride
+    local effectiveDuration = math.floor(stepDef.interactDurationMs * durationMult)
+    local effectiveNoiseRadius = noiseRadiusOverride or stepDef.noiseRadius or 0
+
+    -- Load animation if specified
+    local animLoaded = false
+    if stepDef.animDict then
+        lib.requestAnimDict(stepDef.animDict)
+        TaskPlayAnim(cache.ped, stepDef.animDict, stepDef.animName, 8.0, -8.0, -1, 1, 0, false, false, false)
+        animLoaded = true
+    end
+
+    -- Set up cleanup for interrupts (death, ragdoll, taser)
+    local cleanupDone = false
+    local function doCleanup()
+        if cleanupDone then return end
+        cleanupDone = true
+        activeInteractionCleanup = nil
+
+        ClearPedTasks(cache.ped)
+        if stepDef.animDict then
+            RemoveAnimDict(stepDef.animDict)
+        end
+    end
+    activeInteractionCleanup = doCleanup
+
+    -- Monitor for death/ragdoll/taser during interaction
+    local interactionAborted = false
+    local monitorThread = CreateThread(function()
+        while not cleanupDone do
+            Wait(100)
+            if IsPedDeadOrDying(cache.ped, true) or IsPedRagdoll(cache.ped) or IsPedBeingStunned(cache.ped, 0) then
+                interactionAborted = true
+                doCleanup()
+                -- Cancel progress bar by clearing tasks (ox_lib should detect this)
+                return
+            end
+        end
+    end)
 
     -- Progress bar
     local completed = lib.progressBar({
-        duration = objDef.interactDurationMs,
-        label = objDef.label .. '...',
+        duration = effectiveDuration,
+        label = stepDef.label .. (toolUsed and (' [' .. toolUsed .. ']') or '') .. '...',
         useWhileDead = false,
         canCancel = true,
         disable = { move = true, car = true, combat = true },
     })
 
-    ClearPedTasks(cache.ped)
-    if objDef.animDict then RemoveAnimDict(objDef.animDict) end
+    -- Cleanup animation regardless of outcome
+    doCleanup()
+
+    if interactionAborted then
+        lib.notify({ title = stepDef.label, description = 'Interrupted!', type = 'error' })
+        -- Apply onFail escalation
+        if stepDef.onFail and stepDef.onFail.escalation then
+            local newLevel = stepDef.onFail.escalation
+            if alertOrder(newLevel) > alertOrder(getAlertLevel(zoneId)) then
+                setAlertLevel(zoneId, newLevel, GetEntityCoords(cache.ped))
+                applyAlertBehavior(zoneId, zoneConfig)
+            end
+        end
+        return
+    end
 
     if not completed then
-        lib.notify({ title = objDef.label, description = 'Cancelled.', type = 'error' })
+        lib.notify({ title = stepDef.label, description = 'Cancelled.', type = 'error' })
+        -- Apply onFail escalation
+        if stepDef.onFail and stepDef.onFail.escalation then
+            local newLevel = stepDef.onFail.escalation
+            if alertOrder(newLevel) > alertOrder(getAlertLevel(zoneId)) then
+                setAlertLevel(zoneId, newLevel, GetEntityCoords(cache.ped))
+                applyAlertBehavior(zoneId, zoneConfig)
+            end
+        end
         return
     end
 
-    -- Server processes the objective (validates items, alert level, rolls loot, applies cooldown)
-    local result = lib.callback.await('qbx_pedscenarios:server:attemptObjective', false,
-        zoneId, objDef.id, getAlertLevel(zoneId))
+    -- Generate noise event at objective coords
+    local objCoords = vec3(objDef.coords.x, objDef.coords.y, objDef.coords.z)
+    generateNoiseEvent(zoneId, objCoords, effectiveNoiseRadius)
 
-    if not result then
-        lib.notify({ title = objDef.label, description = 'Failed.', type = 'error' })
-        return
+    -- Apply onSuccess effects
+    if stepDef.onSuccess then
+        -- Escalation
+        if stepDef.onSuccess.escalation then
+            local newLevel = stepDef.onSuccess.escalation
+            if alertOrder(newLevel) > alertOrder(getAlertLevel(zoneId)) then
+                setAlertLevel(zoneId, newLevel, GetEntityCoords(cache.ped))
+                applyAlertBehavior(zoneId, zoneConfig)
+            end
+        end
+
+        -- Zone effects (temporary modifiers)
+        if stepDef.onSuccess.zoneEffect then
+            activeZoneEffects[zoneId] = activeZoneEffects[zoneId] or {}
+            for key, value in pairs(stepDef.onSuccess.zoneEffect) do
+                activeZoneEffects[zoneId][key] = value
+            end
+            lib.print.info(('Applied zone effect for "%s": %s'):format(zoneId, json.encode(stepDef.onSuccess.zoneEffect)))
+        end
     end
 
-    if result.error == 'cooldown' then
-        local mins = math.ceil((result.remainingMs or 0) / 60000)
-        lib.notify({
-            title = 'Locked',
-            description = ('On cooldown. ~%d min remaining.'):format(mins),
-            type = 'error',
-        })
-        return
-    end
+    -- Mark step as completed for state persistence
+    objectiveOpenStates[zoneId] = objectiveOpenStates[zoneId] or {}
+    objectiveOpenStates[zoneId][stepDef.id] = true
 
-    if result.error == 'missing_item' then
-        lib.notify({
-            title = objDef.label,
-            description = ('You need: %s'):format(result.requiredItem),
-            type = 'error',
-        })
-        return
-    end
-
-    if result.error == 'alert_too_high' then
-        lib.notify({
-            title = 'Too Dangerous',
-            description = 'Can\'t do this while guards are on high alert!',
-            type = 'error',
-        })
-        return
-    end
-
-    if result.error == 'inventory_full' then
-        lib.notify({
-            title = objDef.label,
-            description = 'Your inventory is full. Make room first.',
-            type = 'error',
-        })
-        return
-    end
-
-    if result.result == 'success' then
+    -- Handle loot (if step has loot table, use the server result)
+    if tierResult.result == 'success' then
         local lootDesc = ''
-        if result.loot and #result.loot > 0 then
+        if tierResult.loot and #tierResult.loot > 0 then
             local parts = {}
-            for _, l in ipairs(result.loot) do
+            for _, l in ipairs(tierResult.loot) do
                 parts[#parts + 1] = ('%dx %s'):format(l.quantity, l.item)
             end
             lootDesc = table.concat(parts, ', ')
         else
-            lootDesc = 'Nothing useful'
+            lootDesc = 'Done'
         end
 
         lib.notify({
-            title = objDef.label,
-            description = ('Success! Got: %s'):format(lootDesc),
+            title = stepDef.label,
+            description = ('Success! %s'):format(lootDesc),
             type = 'success', duration = 5000,
         })
 
         -- Notify about dropped overflow
-        if result.droppedLoot and #result.droppedLoot > 0 then
+        if tierResult.droppedLoot and #tierResult.droppedLoot > 0 then
             local dropParts = {}
-            for _, l in ipairs(result.droppedLoot) do
+            for _, l in ipairs(tierResult.droppedLoot) do
                 dropParts[#dropParts + 1] = ('%dx %s'):format(l.quantity, l.item)
             end
             lib.notify({
@@ -827,6 +1305,13 @@ interactWithObjective = function(zoneId, objDef)
                 type = 'warning', duration = 5000,
             })
         end
+    elseif tierResult.result == 'no_loot' or not tierResult.result then
+        -- Step completed but no loot (e.g. camera disable)
+        lib.notify({
+            title = stepDef.label,
+            description = 'Done.',
+            type = 'success', duration = 3000,
+        })
     end
 end
 
@@ -848,6 +1333,203 @@ local function cleanupObjectives(zoneId)
         end
         zoneObjectiveProps[zoneId] = nil
     end
+end
+
+-- ============================================================================
+-- DEBUG VISUALIZATION
+-- ============================================================================
+
+--- Draw a detection cone from a guard's position/facing
+---@param ped integer
+---@param range number
+---@param r integer
+---@param g integer
+---@param b integer
+---@param a integer
+local function drawDetectionCone(ped, range, r, g, b, a)
+    local pedCoords = GetEntityCoords(ped)
+    local fwd = GetEntityForwardVector(ped)
+    local coneLen = Config.DebugVisualization.coneLength or 10.0
+    local actualLen = math.min(range, coneLen)
+
+    -- Draw center line
+    local endPoint = pedCoords + fwd * actualLen
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        endPoint.x, endPoint.y, endPoint.z + 0.5,
+        r, g, b, a)
+
+    -- Draw cone edges (left and right at FOV boundary)
+    local fovDot = Config.Stealth.guardFovDot or -0.2
+    local halfAngle = math.acos(math.max(-1, math.min(1, fovDot)))
+    local cosA = math.cos(halfAngle)
+    local sinA = math.sin(halfAngle)
+
+    -- Left edge
+    local leftX = fwd.x * cosA - fwd.y * sinA
+    local leftY = fwd.x * sinA + fwd.y * cosA
+    local leftEnd = pedCoords + vec3(leftX, leftY, fwd.z) * actualLen
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        leftEnd.x, leftEnd.y, leftEnd.z + 0.5,
+        r, g, b, a)
+
+    -- Right edge
+    local rightX = fwd.x * cosA + fwd.y * sinA
+    local rightY = -fwd.x * sinA + fwd.y * cosA
+    local rightEnd = pedCoords + vec3(rightX, rightY, fwd.z) * actualLen
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        rightEnd.x, rightEnd.y, rightEnd.z + 0.5,
+        r, g, b, a)
+end
+
+--- Draw a suspicion bar above a guard's head
+---@param ped integer
+---@param suspicion number -- 0 to ~100
+local function drawSuspicionBar(ped, suspicion)
+    local pedCoords = GetEntityCoords(ped)
+    local aboveHead = pedCoords + vec3(0, 0, 1.2)
+    local fraction = math.min(suspicion / (Config.Stealth.suspicionThreshold or 100.0), 1.0)
+
+    -- Color gradient: green → yellow → red
+    local r = math.floor(255 * math.min(fraction * 2, 1.0))
+    local g = math.floor(255 * math.min((1.0 - fraction) * 2, 1.0))
+
+    SetDrawOrigin(aboveHead.x, aboveHead.y, aboveHead.z, 0)
+
+    -- Background bar
+    DrawRect(0.0, 0.0, 0.04, 0.006, 0, 0, 0, 120)
+    -- Filled portion
+    local barWidth = 0.038 * fraction
+    local barOffset = -0.019 + barWidth / 2
+    if barWidth > 0.001 then
+        DrawRect(barOffset, 0.0, barWidth, 0.004, r, g, 0, 200)
+    end
+
+    EndScriptGfx2dCommands()
+end
+
+--- Draw morale indicator above a guard's head
+---@param ped integer
+---@param morale number
+local function drawMoraleIndicator(ped, morale)
+    local pedCoords = GetEntityCoords(ped)
+    local aboveHead = pedCoords + vec3(0, 0, 1.5)
+    local cfg = Config.GuardMorale
+
+    -- Color: green at full, yellow at retreat threshold, red at flee threshold
+    local r, g, b = 0, 255, 0
+    if morale <= (cfg.fleeThreshold or 30) then
+        r, g, b = 255, 0, 0
+    elseif morale <= (cfg.retreatThreshold or 50) then
+        r, g, b = 255, 165, 0
+    elseif morale <= 70 then
+        r, g, b = 255, 255, 0
+    end
+
+    -- Draw as a small marker
+    DrawMarker(2, aboveHead.x, aboveHead.y, aboveHead.z, 0, 0, 0, 0, 0, 0,
+        0.15, 0.15, 0.15, r, g, b, 200, false, false, 2, false, nil, nil, false)
+end
+
+--- Draw patrol waypoints as numbered markers
+---@param zoneConfig table
+local function drawPatrolWaypoints(zoneConfig)
+    if not zoneConfig.patrols then return end
+
+    for _, patrol in ipairs(zoneConfig.patrols) do
+        for idx, wp in ipairs(patrol.waypoints) do
+            DrawMarker(1, wp.x, wp.y, wp.z - 0.95, 0, 0, 0, 0, 0, 0,
+                0.5, 0.5, 0.5, 0, 150, 255, 100, false, false, 2, false, nil, nil, false)
+
+            -- Number above waypoint
+            SetDrawOrigin(wp.x, wp.y, wp.z + 0.5, 0)
+            DrawRect(0.0, 0.0, 0.012, 0.018, 0, 0, 0, 150)
+            EndScriptGfx2dCommands()
+        end
+    end
+end
+
+--- Draw objective state markers
+---@param zoneId string
+---@param zoneConfig table
+local function drawObjectiveStates(zoneId, zoneConfig)
+    if not zoneConfig.objectives then return end
+
+    for _, obj in ipairs(zoneConfig.objectives) do
+        local objPos = vec3(obj.coords.x, obj.coords.y, obj.coords.z)
+        local steps = getObjectiveSteps(obj)
+
+        for _, step in ipairs(steps) do
+            local isOpen = objectiveOpenStates[zoneId] and objectiveOpenStates[zoneId][step.id]
+            local r, g, b = 255, 0, 0 -- red = locked
+            if isOpen then
+                r, g, b = 0, 255, 0 -- green = open
+            end
+
+            DrawMarker(28, objPos.x, objPos.y, objPos.z + 1.5, 0, 0, 0, 0, 0, 0,
+                0.3, 0.3, 0.3, r, g, b, 150, true, false, 2, false, nil, nil, false)
+        end
+    end
+end
+
+--- Main debug visualization thread for a zone
+---@param zoneId string
+---@param zoneConfig table
+local function startDebugVisualization(zoneId, zoneConfig)
+    if not Config.Debug or not Config.DebugVisualization then return end
+    local dbg = Config.DebugVisualization
+
+    CreateThread(function()
+        while secZoneActive[zoneId] do
+            Wait(0) -- Runs every frame for drawing
+
+            local level = getAlertLevel(zoneId)
+
+            for ped, data in pairs(secGuards) do
+                if data.zoneId ~= zoneId or not data.alive or not DoesEntityExist(ped) then
+                    goto nextDebugGuard
+                end
+
+                local effectiveRange = calculateDetectionRange(ped, zoneConfig.detectionRadius, zoneId)
+
+                -- Detection cones
+                if dbg.drawDetectionCones then
+                    local r, g, b = 0, 255, 0
+                    if level == 'suspicious' then
+                        r, g, b = 255, 255, 0
+                    elseif level == 'alert' then
+                        r, g, b = 255, 165, 0
+                    elseif level == 'combat' then
+                        r, g, b = 255, 0, 0
+                    end
+                    drawDetectionCone(ped, effectiveRange, r, g, b, dbg.coneAlpha or 80)
+                end
+
+                -- Suspicion bars
+                if dbg.drawSuspicionBars then
+                    drawSuspicionBar(ped, data.suspicion)
+                end
+
+                -- Morale indicators
+                if dbg.drawMoraleIndicators and Config.GuardMorale and Config.GuardMorale.enabled then
+                    if not isMoraleImmune(data.archetypeId) then
+                        drawMoraleIndicator(ped, data.morale)
+                    end
+                end
+
+                ::nextDebugGuard::
+            end
+
+            -- Patrol waypoints
+            if dbg.drawPatrolWaypoints then
+                drawPatrolWaypoints(zoneConfig)
+            end
+
+            -- Objective states
+            if dbg.drawObjectiveStates then
+                drawObjectiveStates(zoneId, zoneConfig)
+            end
+        end
+    end)
 end
 
 -- ============================================================================
@@ -927,6 +1609,36 @@ local function detectionTick(zoneId, zoneConfig)
         end
     end
 
+    -- Guard discovery of opened objectives
+    if objectiveOpenStates[zoneId] and zoneConfig.objectives then
+        for _, obj in ipairs(zoneConfig.objectives) do
+            local steps = getObjectiveSteps(obj)
+            for _, step in ipairs(steps) do
+                if objectiveOpenStates[zoneId][step.id] then
+                    local objPos = vec3(obj.coords.x, obj.coords.y, obj.coords.z)
+                    for alivePed, aliveData in pairs(secGuards) do
+                        if aliveData.zoneId == zoneId and aliveData.alive and DoesEntityExist(alivePed) then
+                            local dist = #(objPos - GetEntityCoords(alivePed))
+                            if dist < zoneConfig.detectionRadius
+                                and isPedFacingPosition(alivePed, objPos)
+                                and HasEntityClearLosToCoord(alivePed, objPos.x, objPos.y, objPos.z, 17) then
+                                -- Guard discovered the opened objective — server callback to re-lock and escalate
+                                objectiveOpenStates[zoneId][step.id] = nil
+                                lib.callback.await('qbx_pedscenarios:server:guardDiscoveredStep', false,
+                                    zoneId, obj.id, step.id)
+                                if alertOrder(level) < alertOrder('alert') then
+                                    setAlertLevel(zoneId, 'alert', objPos)
+                                    applyAlertBehavior(zoneId, zoneConfig)
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     -- Guard-by-guard detection
     local anyDetected = false
     local thresholdMult = zoneConfig.alertOverrides and zoneConfig.alertOverrides.suspicionThresholdMult or 1.0
@@ -952,56 +1664,82 @@ local function detectionTick(zoneId, zoneConfig)
             goto nextGuard
         end
 
-        local pedCoords = GetEntityCoords(ped)
-        local dist = #(playerCoords - pedCoords)
-        local effectiveRange = calculateDetectionRange(ped, zoneConfig.detectionRadius, zoneId)
-
-        -- Disguised players only detected at closer range
-        if disguiseSuspicious then
-            local ds = Config.Stealth.disguiseSuspicion
-            effectiveRange = effectiveRange * (ds and ds.rangeFraction or 0.5)
+        -- Update morale
+        if Config.GuardMorale and Config.GuardMorale.enabled then
+            updateGuardMorale(ped, data, zoneId)
         end
 
-        if dist < effectiveRange then
-            local hasLOS = HasEntityClearLosToEntity(ped, cache.ped, 17)
-            local isFacing = isPedFacingPosition(ped, playerCoords)
-
-            if hasLOS and isFacing then
-                anyDetected = true
-                state.lastKnownPlayerPos = playerCoords
-
-                -- Build suspicion (modified by disguise)
-                if disguiseSuspicious then
-                    local ds = Config.Stealth.disguiseSuspicion
-                    local rate = Config.Stealth.suspicionBuildRate * (ds and ds.buildRateFraction or 0.2) * disguiseSuspMult
-                    data.suspicion = data.suspicion + rate
-                else
-                    data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate
+        -- Tactical retreat threshold check (from archetype tactics)
+        local archetype = getArchetype(data.archetypeId)
+        if archetype and archetype.tactics and archetype.tactics.retreatThreshold then
+            local maxHp = GetEntityMaxHealth(ped)
+            local curHp = GetEntityHealth(ped)
+            if maxHp > 0 and (curHp / maxHp) < archetype.tactics.retreatThreshold then
+                if not data.fleeing then
+                    data.fleeing = true
+                    ClearPedTasks(ped)
+                    TaskSmartFleePed(ped, cache.ped, 100.0, -1, false, false)
+                    SetPedKeepTask(ped, true)
                 end
+                goto nextGuard
+            end
+        end
 
-                -- Check if player attacked any guard
-                if HasEntityBeenDamagedByEntity(ped, cache.ped, true) then
-                    ClearEntityLastDamageEntity(ped)
-                    state.suspicionPool = effectiveThreshold
-                    if alertOrder(level) < alertOrder('combat') then
-                        setAlertLevel(zoneId, 'combat', playerCoords)
-                        applyAlertBehavior(zoneId, zoneConfig)
-                        return
+        -- Skip guards that are fleeing
+        if data.fleeing then goto nextGuard end
+
+        do
+            local pedCoords = GetEntityCoords(ped)
+            local dist = #(playerCoords - pedCoords)
+            local effectiveRange = calculateDetectionRange(ped, zoneConfig.detectionRadius, zoneId)
+
+            -- Disguised players only detected at closer range
+            if disguiseSuspicious then
+                local ds = Config.Stealth.disguiseSuspicion
+                effectiveRange = effectiveRange * (ds and ds.rangeFraction or 0.5)
+            end
+
+            if dist < effectiveRange then
+                local hasLOS = HasEntityClearLosToEntity(ped, cache.ped, 17)
+                local isFacing = isPedFacingPosition(ped, playerCoords)
+
+                if hasLOS and isFacing then
+                    anyDetected = true
+                    state.lastKnownPlayerPos = playerCoords
+
+                    -- Build suspicion (modified by disguise)
+                    if disguiseSuspicious then
+                        local ds = Config.Stealth.disguiseSuspicion
+                        local rate = Config.Stealth.suspicionBuildRate * (ds and ds.buildRateFraction or 0.2) * disguiseSuspMult
+                        data.suspicion = data.suspicion + rate
+                    else
+                        data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate
+                    end
+
+                    -- Check if player attacked any guard
+                    if HasEntityBeenDamagedByEntity(ped, cache.ped, true) then
+                        ClearEntityLastDamageEntity(ped)
+                        state.suspicionPool = effectiveThreshold
+                        if alertOrder(level) < alertOrder('combat') then
+                            setAlertLevel(zoneId, 'combat', playerCoords)
+                            applyAlertBehavior(zoneId, zoneConfig)
+                            return
+                        end
+                    end
+                elseif hasLOS and not isFacing then
+                    -- Guard has LOS but isn't looking: very slow suspicion (peripheral awareness)
+                    data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.1
+                else
+                    -- No LOS: behind-cover logic
+                    if dist < effectiveRange * Config.Stealth.behindCoverModifier then
+                        data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.3
+                    else
+                        data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
                     end
                 end
-            elseif hasLOS and not isFacing then
-                -- Guard has LOS but isn't looking: very slow suspicion (peripheral awareness)
-                data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.1
             else
-                -- No LOS: behind-cover logic
-                if dist < effectiveRange * Config.Stealth.behindCoverModifier then
-                    data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.3
-                else
-                    data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
-                end
+                data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
             end
-        else
-            data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
         end
 
         ::nextGuard::
@@ -1092,17 +1830,101 @@ local function reinforcementLoop(zoneId, zoneConfig)
             local elapsed = GetGameTimer() - state.combatStartedAt
             local currentWave = reinforcementWave[zoneId] or 0
 
+            -- Apply reinforcement delay from zone effects (e.g. jammed comms)
+            local effectiveDelay = 0
+            local effects = activeZoneEffects[zoneId]
+            if effects and effects.reinforcementDelay then
+                effectiveDelay = effects.reinforcementDelay
+            end
+
+            -- Defined waves
             if currentWave < cfg.maxWaves and currentWave < #cfg.waves then
                 local nextWave = cfg.waves[currentWave + 1]
-                if elapsed >= nextWave.delayMs then
+                local delayWithEffect = nextWave.delayMs + effectiveDelay
+                if elapsed >= delayWithEffect then
                     reinforcementWave[zoneId] = currentWave + 1
                     spawnReinforcementWave(nextWave, zoneId, zoneConfig)
                     lib.print.info(('Zone "%s" reinforcement wave %d/%d'):format(
                         zoneId, currentWave + 1, cfg.maxWaves))
                 end
+            elseif cfg.continuous and currentWave >= #cfg.waves then
+                -- Continuous reinforcement waves after defined waves complete
+                state.continuousWaveCount = state.continuousWaveCount or 0
+                local continuousInterval = cfg.continuousIntervalMs or 25000
+                local lastWaveTime = 0
+
+                -- Calculate time since last wave
+                if #cfg.waves > 0 then
+                    lastWaveTime = cfg.waves[#cfg.waves].delayMs + effectiveDelay
+                end
+
+                local continuousElapsed = elapsed - lastWaveTime
+                local expectedWaves = math.floor(continuousElapsed / continuousInterval)
+
+                if expectedWaves > state.continuousWaveCount then
+                    state.continuousWaveCount = state.continuousWaveCount + 1
+                    spawnContinuousWave(cfg, zoneId, zoneConfig)
+                    lib.print.info(('Zone "%s" continuous reinforcement wave %d'):format(
+                        zoneId, state.continuousWaveCount))
+                end
             end
 
             ::tick::
+        end
+    end)
+end
+
+-- ============================================================================
+-- PURSUIT MANAGEMENT
+-- ============================================================================
+
+--- Start a pursuit thread for a guard that continues chasing after zone exit
+---@param ped integer
+---@param data GuardData
+local function startPursuit(ped, data)
+    local archetype = getArchetype(data.archetypeId)
+    local tactics = archetype and archetype.tactics or {}
+    local losTimeout = tactics.pursueLosTimeout or 20000
+
+    pursuingGuards[ped] = {
+        zoneId = data.zoneId,
+        lastLosTime = GetGameTimer(),
+        losTimeout = losTimeout,
+    }
+
+    CreateThread(function()
+        while pursuingGuards[ped] and DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) do
+            Wait(1000)
+
+            local pursuit = pursuingGuards[ped]
+            if not pursuit then break end
+
+            local hasLOS = HasEntityClearLosToEntity(ped, cache.ped, 17)
+            if hasLOS then
+                pursuit.lastLosTime = GetGameTimer()
+                TaskCombatPed(ped, cache.ped, 0, 16)
+                SetPedKeepTask(ped, true)
+            else
+                -- Check if LOS timeout exceeded
+                if GetGameTimer() - pursuit.lastLosTime > pursuit.losTimeout then
+                    -- Give up pursuit
+                    pursuingGuards[ped] = nil
+                    ClearPedTasks(ped)
+                    ReleaseScenarioPed(ped)
+                    secGuards[ped] = nil
+                    lib.print.info(('Guard %d gave up pursuit (LOS timeout)'):format(ped))
+                    break
+                end
+            end
+        end
+
+        -- Cleanup if ped died during pursuit
+        if pursuingGuards[ped] then
+            pursuingGuards[ped] = nil
+            if DoesEntityExist(ped) then
+                ReleaseScenarioPed(ped)
+            end
+            secGuards[ped] = nil
         end
     end)
 end
@@ -1128,6 +1950,7 @@ function InitSecurityZones()
                 deadPostGuards[zoneId] = nil
                 playerAccess[zoneId] = nil
                 keycardCache[zoneId] = nil
+                activeZoneEffects[zoneId] = nil
 
                 -- Initialize alert state
                 zoneAlertState[zoneId] = {
@@ -1136,6 +1959,7 @@ function InitSecurityZones()
                     lastKnownPlayerPos = nil,
                     suspicionPool = 0,
                     combatStartedAt = nil,
+                    continuousWaveCount = 0,
                 }
 
                 lib.print.info(('Entered security zone: %s'):format(config.label))
@@ -1152,15 +1976,37 @@ function InitSecurityZones()
                     end
                 end
 
-                -- Spawn post guards
-                for _, post in ipairs(config.posts) do
-                    spawnPostGuard(post, zoneId, config)
+                -- Determine shift-based overrides
+                local shiftArchetype = nil
+                local postMultiplier = 1.0
+                local patrolMultiplier = 1.0
+
+                if Config.GuardShifts and Config.GuardShifts.enabled and config.shifts then
+                    local currentShift = getCurrentShift(config.shifts)
+                    if currentShift then
+                        shiftArchetype = currentShift.defaultArchetype
+                        postMultiplier = currentShift.postMultiplier or 1.0
+                        patrolMultiplier = currentShift.patrolMultiplier or 1.0
+                        lib.print.info(('Zone "%s" using shift archetype: %s (post: %.1f, patrol: %.1f)'):format(
+                            zoneId, shiftArchetype or 'default', postMultiplier, patrolMultiplier))
+                    end
                 end
 
-                -- Spawn patrol guards
+                -- Spawn post guards (with shift multiplier)
+                for _, post in ipairs(config.posts) do
+                    local spawnCount = applySpawnMultiplier(postMultiplier)
+                    for _ = 1, spawnCount do
+                        spawnPostGuard(post, zoneId, config, shiftArchetype)
+                    end
+                end
+
+                -- Spawn patrol guards (with shift multiplier)
                 if config.patrols then
                     for _, patrol in ipairs(config.patrols) do
-                        spawnPatrolGuard(patrol, zoneId, config)
+                        local spawnCount = applySpawnMultiplier(patrolMultiplier)
+                        for _ = 1, spawnCount do
+                            spawnPatrolGuard(patrol, zoneId, config, shiftArchetype)
+                        end
                     end
                 end
 
@@ -1169,6 +2015,9 @@ function InitSecurityZones()
 
                 -- Start reinforcement manager
                 reinforcementLoop(zoneId, config)
+
+                -- Start debug visualization
+                startDebugVisualization(zoneId, config)
 
                 -- Main detection loop (interval adapts to alert level)
                 CreateThread(function()
@@ -1195,6 +2044,19 @@ function InitSecurityZones()
                 local state = zoneAlertState[zoneId]
                 local inCombat = state and state.level == 'combat'
 
+                -- Handle pursuit on exit: guards with pursueOnExit continue chasing
+                if inCombat then
+                    for ped, data in pairs(secGuards) do
+                        if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
+                            local archetype = getArchetype(data.archetypeId)
+                            local tactics = archetype and archetype.tactics or {}
+                            if tactics.pursueOnExit then
+                                startPursuit(ped, data)
+                            end
+                        end
+                    end
+                end
+
                 if inCombat and config.reinforcements and config.reinforcements.enabled then
                     -- Keep relationships hostile while reinforcements are still arriving
                     reinforcementsActive[zoneId] = true
@@ -1220,6 +2082,7 @@ function InitSecurityZones()
                             end
                         end
 
+                        -- Stop continuous waves on zone exit
                         reinforcementsActive[zoneId] = nil
 
                         -- Let combat play out before releasing guards
@@ -1231,8 +2094,11 @@ function InitSecurityZones()
 
                             for ped, data in pairs(secGuards) do
                                 if data.zoneId == zoneId then
-                                    ReleaseScenarioPed(ped)
-                                    secGuards[ped] = nil
+                                    -- Don't release pursuing guards (they manage themselves)
+                                    if not pursuingGuards[ped] then
+                                        ReleaseScenarioPed(ped)
+                                        secGuards[ped] = nil
+                                    end
                                 end
                             end
                             zoneAlertState[zoneId] = nil
@@ -1249,8 +2115,11 @@ function InitSecurityZones()
                         if not secZoneActive[zoneId] then
                             for ped, data in pairs(secGuards) do
                                 if data.zoneId == zoneId then
-                                    ReleaseScenarioPed(ped)
-                                    secGuards[ped] = nil
+                                    -- Don't release pursuing guards
+                                    if not pursuingGuards[ped] then
+                                        ReleaseScenarioPed(ped)
+                                        secGuards[ped] = nil
+                                    end
                                 end
                             end
                             zoneAlertState[zoneId] = nil
@@ -1279,8 +2148,22 @@ function CleanupSecurityZones()
     end
     secGuards = {}
 
+    -- Clean up pursuing guards
+    for ped in pairs(pursuingGuards) do
+        if DoesEntityExist(ped) then
+            RemoveScenarioPed(ped)
+        end
+    end
+    pursuingGuards = {}
+
     for zoneId in pairs(zoneObjectiveProps) do
         cleanupObjectives(zoneId)
+    end
+
+    -- Clean up any active interaction animation
+    if activeInteractionCleanup then
+        activeInteractionCleanup()
+        activeInteractionCleanup = nil
     end
 
     SetRelationshipBetweenGroups(1, `SECURITY_GUARD`, `PLAYER`)
@@ -1291,4 +2174,20 @@ function CleanupSecurityZones()
     playerAccess = {}
     keycardCache = {}
     deadPostGuards = {}
+    objectiveOpenStates = {}
+    activeZoneEffects = {}
 end
+
+-- ============================================================================
+-- RESOURCE STOP CLEANUP
+-- ============================================================================
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource == GetCurrentResourceName() then
+        -- Clean up any in-progress interaction animation/props
+        if activeInteractionCleanup then
+            activeInteractionCleanup()
+            activeInteractionCleanup = nil
+        end
+    end
+end)

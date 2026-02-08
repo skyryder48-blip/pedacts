@@ -182,6 +182,108 @@ function GivePedLoadout(ped, weapon, ammo)
     SetCurrentPedWeapon(ped, weapon, true)
 end
 
+-- ============================================================================
+-- DEBUG VISUALIZATION HELPERS
+-- Used by security zone detection system when Config.Debug is true.
+-- ============================================================================
+
+--- Draw a 3D text label above a world position
+---@param coords vector3
+---@param text string
+---@param r? integer
+---@param g? integer
+---@param b? integer
+function DrawDebugText3D(coords, text, r, g, b)
+    local onScreen, screenX, screenY = World3dToScreen2d(coords.x, coords.y, coords.z + 1.0)
+    if onScreen then
+        SetTextScale(0.3, 0.3)
+        SetTextFont(4)
+        SetTextProportional(true)
+        SetTextColour(r or 255, g or 255, b or 255, 215)
+        SetTextDropshadow(0, 0, 0, 0, 255)
+        SetTextOutline()
+        SetTextEntry('STRING')
+        AddTextComponentString(text)
+        DrawText(screenX, screenY)
+    end
+end
+
+--- Draw a horizontal bar above a world position (like a health bar)
+---@param coords vector3
+---@param value number 0-100
+---@param maxValue number
+---@param offsetY? number screen-space vertical offset
+---@param r? integer
+---@param g? integer
+---@param b? integer
+function DrawDebugBar(coords, value, maxValue, offsetY, r, g, b)
+    local onScreen, screenX, screenY = World3dToScreen2d(coords.x, coords.y, coords.z + 1.2)
+    if not onScreen then return end
+
+    screenY = screenY + (offsetY or 0.0)
+    local barWidth = 0.04
+    local barHeight = 0.006
+    local fillFraction = math.min(value / maxValue, 1.0)
+
+    -- Background
+    DrawRect(screenX, screenY, barWidth, barHeight, 0, 0, 0, 150)
+    -- Fill
+    local fillX = screenX - barWidth * 0.5 + (barWidth * fillFraction * 0.5)
+    DrawRect(fillX, screenY, barWidth * fillFraction, barHeight, r or 255, g or 200, b or 0, 200)
+end
+
+--- Draw a detection cone line for a guard (simplified as a forward line)
+---@param ped integer
+---@param length number
+---@param r integer
+---@param g integer
+---@param b integer
+---@param a integer
+function DrawDebugCone(ped, length, r, g, b, a)
+    local pedCoords = GetEntityCoords(ped)
+    local fwd = GetEntityForwardVector(ped)
+    local endPos = pedCoords + fwd * length
+
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        endPos.x, endPos.y, endPos.z + 0.5,
+        r, g, b, a)
+
+    -- Draw cone edges (approx FOV)
+    local fovDot = Config.Stealth and Config.Stealth.guardFovDot or -0.2
+    local halfAngle = math.acos(math.max(-1.0, math.min(1.0, fovDot)))
+    local sinA = math.sin(halfAngle)
+    local cosA = math.cos(halfAngle)
+
+    -- Left edge
+    local leftX = fwd.x * cosA - fwd.y * sinA
+    local leftY = fwd.x * sinA + fwd.y * cosA
+    local leftEnd = pedCoords + vec3(leftX, leftY, 0.0) * length
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        leftEnd.x, leftEnd.y, leftEnd.z + 0.5,
+        r, g, b, a * 0.5)
+
+    -- Right edge
+    local rightX = fwd.x * cosA + fwd.y * sinA
+    local rightY = -fwd.x * sinA + fwd.y * cosA
+    local rightEnd = pedCoords + vec3(rightX, rightY, 0.0) * length
+    DrawLine(pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        rightEnd.x, rightEnd.y, rightEnd.z + 0.5,
+        r, g, b, a * 0.5)
+end
+
+--- Draw a small marker at a world position
+---@param coords vector3|vector4
+---@param r integer
+---@param g integer
+---@param b integer
+---@param label? string
+function DrawDebugMarker(coords, r, g, b, label)
+    DrawMarker(28, coords.x, coords.y, coords.z + 0.5, 0, 0, 0, 0, 0, 0, 0.15, 0.15, 0.15, r, g, b, 180, false, true, 2, false, nil, nil, false)
+    if label then
+        DrawDebugText3D(vec3(coords.x, coords.y, coords.z), label, r, g, b)
+    end
+end
+
 -- Cleanup on resource stop
 AddEventHandler('onResourceStop', function(resource)
     if resource == GetCurrentResourceName() then
