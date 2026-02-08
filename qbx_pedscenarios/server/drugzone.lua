@@ -463,7 +463,10 @@ CreateThread(function()
         tickCount = tickCount + 1
         if tickCount >= saveEveryNTicks then
             tickCount = 0
-            saveAllDirtyHeat()
+            local ok, err = pcall(saveAllDirtyHeat)
+            if not ok then
+                lib.print.error(('Heat save failed (will retry next cycle): %s'):format(tostring(err)))
+            end
         end
     end
 end)
@@ -476,7 +479,10 @@ CreateThread(function()
         for source in pairs(dirtyRep) do
             -- Verify player is still connected
             if GetPlayerName(source) then
-                savePlayerRepAll(source)
+                local ok, err = pcall(savePlayerRepAll, source)
+                if not ok then
+                    lib.print.error(('Rep save failed for %s (will retry): %s'):format(source, tostring(err)))
+                end
             else
                 -- Player gone, clean up
                 dirtyRep[source] = nil
@@ -770,8 +776,13 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
         removeRep(source, session.zoneId, Config.Reputation.lossOnRiskEvent)
         addHeat(session.zoneId, 8.0)
 
-        -- Still take their items
-        exports.ox_inventory:RemoveItem(source, session.itemName, session.quantity)
+        -- Still take their items (verify removal succeeds)
+        local removed = exports.ox_inventory:RemoveItem(source, session.itemName, session.quantity)
+        local stealItem = removed and true or false
+        if not removed then
+            lib.print.warn(('Undercover bust: RemoveItem failed for player %s (%s x%d)'):format(
+                source, session.itemName, session.quantity))
+        end
 
         negotiations[source] = nil
 
@@ -782,7 +793,7 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
                 label = 'Undercover Vehicle',
                 wantedLevel = 3,
                 pedAttacks = false,
-                stealItem = true,
+                stealItem = stealItem,
                 pedModel = `s_m_y_cop_01`,
             },
         }
@@ -797,8 +808,14 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
         removeRep(source, session.zoneId, Config.Reputation.lossOnRiskEvent)
         addHeat(session.zoneId, 5.0)
 
+        local stealItem = false
         if riskEvent.stealItem then
-            exports.ox_inventory:RemoveItem(source, session.itemName, session.quantity)
+            local removed = exports.ox_inventory:RemoveItem(source, session.itemName, session.quantity)
+            stealItem = removed and true or false
+            if not removed then
+                lib.print.warn(('Risk event "%s": RemoveItem failed for player %s (%s x%d)'):format(
+                    riskEvent.id, source, session.itemName, session.quantity))
+            end
         end
 
         negotiations[source] = nil
@@ -810,7 +827,7 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
                 label = riskEvent.label,
                 wantedLevel = riskEvent.wantedLevel,
                 pedAttacks = riskEvent.pedAttacks,
-                stealItem = riskEvent.stealItem,
+                stealItem = stealItem,
                 pedModel = riskEvent.pedModel,
             },
         }

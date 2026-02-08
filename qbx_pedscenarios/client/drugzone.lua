@@ -261,125 +261,137 @@ end
 local function runNegotiation(ped, data)
     if inNegotiation then return nil end
     inNegotiation = true
-    data.state = PedState.NEGOTIATING
 
-    local archetype = getArchetype(data.archetypeId) or getVehicleArchetype(data.archetypeId)
-    if not archetype then inNegotiation = false return nil end
+    -- Use pcall so inNegotiation is ALWAYS reset, even if a callback errors
+    local ok, result = pcall(function()
+        data.state = PedState.NEGOTIATING
 
-    local offer = lib.callback.await('qbx_pedscenarios:server:startNegotiation', false,
-        data.zoneId, data.archetypeId, data.requestedItem, data.quantity)
+        local archetype = getArchetype(data.archetypeId) or getVehicleArchetype(data.archetypeId)
+        if not archetype then return nil end
 
-    if not offer or offer.error then
-        inNegotiation = false
-        if offer and offer.error == 'missing_items' then
-            lib.notify({
-                title = 'Drug Deal',
-                description = ("You don't have enough. Need %d, you have %d."):format(data.quantity, offer.hasCount),
-                type = 'error',
-            })
+        local offer = lib.callback.await('qbx_pedscenarios:server:startNegotiation', false,
+            data.zoneId, data.archetypeId, data.requestedItem, data.quantity)
+
+        if not offer or offer.error then
+            if offer and offer.error == 'missing_items' then
+                lib.notify({
+                    title = 'Drug Deal',
+                    description = ("You don't have enough. Need %d, you have %d."):format(data.quantity, offer.hasCount),
+                    type = 'error',
+                })
+            end
+            return nil
         end
+
+        local currentOffer = offer.buyerOffer
+        local round = offer.round
+        local maxRounds = offer.maxRounds
+        local accepted = nil
+
+        while not accepted do
+            local headerText = ('**%s** wants %dx %s'):format(
+                archetype.label, offer.quantity, offer.itemLabel)
+
+            local options = {
+                {
+                    title = ('Accept $%s'):format(lib.math.groupdigits(currentOffer)),
+                    description = 'Take the offer',
+                    icon = 'check',
+                    onSelect = function()
+                        accepted = currentOffer
+                    end,
+                },
+            }
+
+            if round <= maxRounds then
+                options[#options + 1] = {
+                    title = 'Counter-offer',
+                    description = ('Round %d/%d — name your price'):format(round, maxRounds),
+                    icon = 'hand-holding-dollar',
+                    onSelect = function()
+                        local input = lib.inputDialog('Counter Offer', {
+                            {
+                                type = 'number',
+                                label = ('Your price (fair ≈ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
+                                default = offer.fairPrice,
+                                min = 1,
+                                max = math.floor(offer.fairPrice * 2),
+                            },
+                        })
+
+                        if not input then accepted = -1 return end
+
+                        local result = lib.callback.await('qbx_pedscenarios:server:counterOffer', false, math.floor(input[1]))
+
+                        if not result or result.error then accepted = -1 return end
+
+                        if result.result == 'accepted' then
+                            accepted = result.finalPrice
+                        elseif result.result == 'counter' then
+                            currentOffer = result.buyerOffer
+                            round = result.round
+                            lib.notify({
+                                title = 'Negotiation',
+                                description = ('They counter with $%s'):format(lib.math.groupdigits(result.buyerOffer)),
+                                type = 'inform', duration = 3000,
+                            })
+                        elseif result.result == 'final_offer' then
+                            currentOffer = result.finalPrice
+                            round = maxRounds + 1
+                            lib.notify({
+                                title = 'Negotiation',
+                                description = ('Final offer: $%s — take it or leave it.'):format(lib.math.groupdigits(result.finalPrice)),
+                                type = 'warning', duration = 4000,
+                            })
+                        elseif result.result == 'walked_away' then
+                            lib.notify({
+                                title = 'Drug Deal',
+                                description = 'They walked away. You pushed too hard.',
+                                type = 'error',
+                            })
+                            playSpeech(ped, archetype.speechAngry)
+                            accepted = -1
+                        end
+                    end,
+                }
+            end
+
+            options[#options + 1] = {
+                title = 'Refuse',
+                description = 'Turn them away',
+                icon = 'xmark',
+                onSelect = function()
+                    lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
+                    playSpeech(ped, archetype.speechAngry)
+                    accepted = -1
+                end,
+            }
+
+            lib.registerContext({ id = 'drug_negotiation', title = headerText, options = options })
+            lib.showContext('drug_negotiation')
+
+            while not accepted and lib.getOpenContextMenu() == 'drug_negotiation' do
+                Wait(100)
+            end
+
+            if not accepted then
+                lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
+                accepted = -1
+            end
+        end
+
+        return accepted ~= -1 and accepted or nil
+    end)
+
+    inNegotiation = false
+
+    if not ok then
+        lib.print.error(('Negotiation error: %s'):format(tostring(result)))
+        pcall(lib.callback.await, 'qbx_pedscenarios:server:refuseSale', false)
         return nil
     end
 
-    local currentOffer = offer.buyerOffer
-    local round = offer.round
-    local maxRounds = offer.maxRounds
-    local accepted = nil
-
-    while not accepted do
-        local headerText = ('**%s** wants %dx %s'):format(
-            archetype.label, offer.quantity, offer.itemLabel)
-
-        local options = {
-            {
-                title = ('Accept $%s'):format(lib.math.groupdigits(currentOffer)),
-                description = 'Take the offer',
-                icon = 'check',
-                onSelect = function()
-                    accepted = currentOffer
-                end,
-            },
-        }
-
-        if round <= maxRounds then
-            options[#options + 1] = {
-                title = 'Counter-offer',
-                description = ('Round %d/%d — name your price'):format(round, maxRounds),
-                icon = 'hand-holding-dollar',
-                onSelect = function()
-                    local input = lib.inputDialog('Counter Offer', {
-                        {
-                            type = 'number',
-                            label = ('Your price (fair ≈ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
-                            default = offer.fairPrice,
-                            min = 1,
-                            max = math.floor(offer.fairPrice * 2),
-                        },
-                    })
-
-                    if not input then accepted = -1 return end
-
-                    local result = lib.callback.await('qbx_pedscenarios:server:counterOffer', false, math.floor(input[1]))
-
-                    if not result or result.error then accepted = -1 return end
-
-                    if result.result == 'accepted' then
-                        accepted = result.finalPrice
-                    elseif result.result == 'counter' then
-                        currentOffer = result.buyerOffer
-                        round = result.round
-                        lib.notify({
-                            title = 'Negotiation',
-                            description = ('They counter with $%s'):format(lib.math.groupdigits(result.buyerOffer)),
-                            type = 'inform', duration = 3000,
-                        })
-                    elseif result.result == 'final_offer' then
-                        currentOffer = result.finalPrice
-                        round = maxRounds + 1
-                        lib.notify({
-                            title = 'Negotiation',
-                            description = ('Final offer: $%s — take it or leave it.'):format(lib.math.groupdigits(result.finalPrice)),
-                            type = 'warning', duration = 4000,
-                        })
-                    elseif result.result == 'walked_away' then
-                        lib.notify({
-                            title = 'Drug Deal',
-                            description = 'They walked away. You pushed too hard.',
-                            type = 'error',
-                        })
-                        playSpeech(ped, archetype.speechAngry)
-                        accepted = -1
-                    end
-                end,
-            }
-        end
-
-        options[#options + 1] = {
-            title = 'Refuse',
-            description = 'Turn them away',
-            icon = 'xmark',
-            onSelect = function()
-                lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
-                playSpeech(ped, archetype.speechAngry)
-                accepted = -1
-            end,
-        }
-
-        lib.registerContext({ id = 'drug_negotiation', title = headerText, options = options })
-        lib.showContext('drug_negotiation')
-
-        while not accepted and lib.getOpenContextMenu() == 'drug_negotiation' do
-            Wait(100)
-        end
-
-        if not accepted then
-            lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
-            accepted = -1
-        end
-    end
-
-    inNegotiation = false
-    return accepted ~= -1 and accepted or nil
+    return result
 end
 
 -- ============================================================================
@@ -979,12 +991,15 @@ local function startUndercoverDispatch(driverPed, zoneId)
     if not data then return end
     data.dispatchThread = true
 
+    local archetype = getVehicleArchetype(data.archetypeId)
+    local intervalMs = (archetype and archetype.dispatchIntervalMs) or 20000
+
     -- Immediate dispatch on spawn
     TriggerServerEvent('qbx_pedscenarios:server:sendUndercoverDispatch', zoneId)
 
     CreateThread(function()
         while data.dispatchThread and DoesEntityExist(driverPed) do
-            Wait(Config.VehicleBuyerArchetypes[2].dispatchIntervalMs or 20000)
+            Wait(intervalMs)
             if not data.dispatchThread then return end
             if not DoesEntityExist(driverPed) then return end
             TriggerServerEvent('qbx_pedscenarios:server:sendUndercoverDispatch', zoneId)
