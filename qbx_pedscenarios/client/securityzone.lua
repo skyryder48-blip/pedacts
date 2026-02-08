@@ -74,6 +74,25 @@ local function getAlertLevel(zoneId)
 end
 
 ---@param zoneId string
+---@return integer?
+local function getNearestGuard(zoneId)
+    local playerCoords = GetEntityCoords(cache.ped)
+    local nearest, nearestDist = nil, math.huge
+
+    for ped, data in pairs(secGuards) do
+        if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
+            local dist = #(playerCoords - GetEntityCoords(ped))
+            if dist < nearestDist then
+                nearest = ped
+                nearestDist = dist
+            end
+        end
+    end
+
+    return nearest
+end
+
+---@param zoneId string
 ---@param newLevel AlertLevel
 ---@param playerPos? vector3
 local function setAlertLevel(zoneId, newLevel, playerPos)
@@ -118,25 +137,6 @@ local function setAlertLevel(zoneId, newLevel, playerPos)
     end
 
     lib.print.info(('Zone "%s" alert: %s → %s'):format(zoneId, oldLevel, newLevel))
-end
-
----@param zoneId string
----@return integer?
-local function getNearestGuard(zoneId)
-    local playerCoords = GetEntityCoords(cache.ped)
-    local nearest, nearestDist = nil, math.huge
-
-    for ped, data in pairs(secGuards) do
-        if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
-            local dist = #(playerCoords - GetEntityCoords(ped))
-            if dist < nearestDist then
-                nearest = ped
-                nearestDist = dist
-            end
-        end
-    end
-
-    return nearest
 end
 
 -- ============================================================================
