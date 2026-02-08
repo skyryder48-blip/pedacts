@@ -823,6 +823,7 @@ function CleanupDrugZones()
 
     cleanupAllVehicleBuyers()
     vehicleCooldowns = {}
+    vehicleToDriver = {}
     inNegotiation = false
 end
 
@@ -850,12 +851,14 @@ local vehicleCooldowns = {} ---@type table<string, integer>  -- zoneId -> next s
 local VehicleState = {
     DRIVING_IN = 'driving_in',
     PARKING = 'parking',
-    DRIVER_EXITING = 'driver_exiting',
     WAITING = 'waiting',
     NEGOTIATING = 'negotiating',
     ROBBERY = 'robbery',
     LEAVING = 'leaving',
 }
+
+--- Reverse lookup: vehicle entity -> driver ped (for exports/interaction)
+local vehicleToDriver = {} ---@type table<integer, integer>
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- VEHICLE SPAWN HELPERS
@@ -909,6 +912,11 @@ local function cleanupVehicleBuyer(driverPed)
 
     data.dispatchThread = false
 
+    -- Clear reverse lookup
+    if data.vehicle then
+        vehicleToDriver[data.vehicle] = nil
+    end
+
     -- Clean up passengers
     if data.passengers then
         for _, passPed in ipairs(data.passengers) do
@@ -932,7 +940,7 @@ local function cleanupVehicleBuyer(driverPed)
     vehicleBuyers[driverPed] = nil
 end
 
---- Have all occupants enter vehicle and drive away, then cleanup
+--- Drive away and cleanup (all occupants remain in vehicle)
 ---@param driverPed integer
 local function vehicleDriveAwayAndCleanup(driverPed)
     local data = vehicleBuyers[driverPed]
@@ -947,31 +955,12 @@ local function vehicleDriveAwayAndCleanup(driverPed)
         return
     end
 
-    -- Get driver back in vehicle if outside
-    if not IsPedInVehicle(driverPed, vehicle, false) then
-        TaskEnterVehicle(driverPed, vehicle, 10000, -1, 2.0, 1, 0)
-        local timeout = GetGameTimer() + 12000
-        while not IsPedInVehicle(driverPed, vehicle, false) and GetGameTimer() < timeout do
-            Wait(500)
-        end
-    end
-
-    -- Get passengers back in
-    if data.passengers then
-        for i, passPed in ipairs(data.passengers) do
-            if DoesEntityExist(passPed) and not IsPedInVehicle(passPed, vehicle, false) then
-                TaskEnterVehicle(passPed, vehicle, 8000, i - 1, 2.0, 1, 0)
-            end
-        end
-        Wait(3000)
-    end
-
-    -- Drive away
-    if DoesEntityExist(driverPed) and DoesEntityExist(vehicle) then
-        ClearPedTasks(driverPed)
-        SetBlockingOfNonTemporaryEvents(driverPed, true)
-        TaskVehicleDriveWander(driverPed, vehicle, 25.0, 786603)
-    end
+    -- Start engine and drive away
+    SetVehicleEngineOn(vehicle, true, true, false)
+    SetVehicleHandbrake(vehicle, false)
+    ClearPedTasks(driverPed)
+    SetBlockingOfNonTemporaryEvents(driverPed, true)
+    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 786603)
 
     -- Delayed cleanup
     SetTimeout(20000, function()
@@ -1004,7 +993,7 @@ local function startUndercoverDispatch(driverPed, zoneId)
 end
 
 -- ────────────────────────────────────────────────────────────────────────────
--- ROBBERY BEHAVIOR
+-- ROBBERY BEHAVIOR (drive-by from vehicle)
 -- ────────────────────────────────────────────────────────────────────────────
 
 ---@param driverPed integer
@@ -1016,30 +1005,37 @@ local function handleRobberyBehavior(driverPed)
     local archetype = getVehicleArchetype(data.archetypeId)
     if not archetype then return end
 
+    local vehicle = data.vehicle
+    if not vehicle or not DoesEntityExist(vehicle) then
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
     lib.notify({
         title = 'Robbery!',
-        description = 'They\'re pulling weapons!',
+        description = 'They\'re pulling weapons from the car!',
         type = 'error', duration = 5000,
     })
 
-    -- Arm all occupants
+    -- Arm passengers for drive-by (driver doesn't shoot, drives)
     local weaponPool = archetype.weapons or { `WEAPON_PISTOL` }
 
-    if DoesEntityExist(driverPed) then
-        local weapon = PickRandom(weaponPool)
-        GivePedLoadout(driverPed, weapon)
-        TaskCombatPed(driverPed, cache.ped, 0, 16)
-        SetPedKeepTask(driverPed, true)
-        SetBlockingOfNonTemporaryEvents(driverPed, true)
-    end
+    -- Enable drive-by combat for all occupants
+    SetPedConfigFlag(driverPed, 35, true) -- CPED_CONFIG_FLAG_DrivebysAllowed
 
     if data.passengers then
         for _, passPed in ipairs(data.passengers) do
             if DoesEntityExist(passPed) then
                 local weapon = PickRandom(weaponPool)
                 GivePedLoadout(passPed, weapon)
-                TaskCombatPed(passPed, cache.ped, 0, 16)
-                SetPedKeepTask(passPed, true)
+                SetPedCombatAttributes(passPed, 3, true) -- CanLeaveVehicle = disabled below
+                SetPedConfigFlag(passPed, 35, true) -- DrivebysAllowed
+
+                -- Drive-by task: shoot from vehicle at player
+                local playerCoords = GetEntityCoords(cache.ped)
+                TaskDriveBy(passPed, cache.ped, 0,
+                    playerCoords.x, playerCoords.y, playerCoords.z,
+                    50.0, 100, true, `FIRING_PATTERN_BURST_FIRE_DRIVEBY`)
                 SetBlockingOfNonTemporaryEvents(passPed, true)
             end
         end
@@ -1048,38 +1044,25 @@ local function handleRobberyBehavior(driverPed)
     -- Server-side robbery processing (steal items, add heat)
     lib.callback.await('qbx_pedscenarios:server:processVehicleRobbery', false, data.zoneId)
 
-    -- After a delay, they flee in the vehicle
-    SetTimeout(8000, function()
-        if not DoesEntityExist(driverPed) then
+    -- After a delay, they flee
+    SetTimeout(6000, function()
+        if not DoesEntityExist(driverPed) or not DoesEntityExist(vehicle) then
             cleanupVehicleBuyer(driverPed)
             return
         end
 
-        -- Try to flee in vehicle
-        local vehicle = data.vehicle
-        if vehicle and DoesEntityExist(vehicle) then
-            ClearPedTasks(driverPed)
-            if not IsPedInVehicle(driverPed, vehicle, false) then
-                TaskEnterVehicle(driverPed, vehicle, 5000, -1, 5.0, 1, 0)
-                Wait(4000)
-            end
+        -- Floor it out of there
+        SetVehicleEngineOn(vehicle, true, true, false)
+        SetVehicleHandbrake(vehicle, false)
+        ClearPedTasks(driverPed)
+        TaskVehicleDriveWander(driverPed, vehicle, 35.0, 786988) -- 786988 = rush + avoid traffic + ignore lights
 
-            if data.passengers then
-                for i, passPed in ipairs(data.passengers) do
-                    if DoesEntityExist(passPed) then
-                        ClearPedTasks(passPed)
-                        TaskEnterVehicle(passPed, vehicle, 5000, i - 1, 5.0, 1, 0)
-                    end
+        -- Clear passenger drive-by tasks so they stop shooting
+        if data.passengers then
+            for _, passPed in ipairs(data.passengers) do
+                if DoesEntityExist(passPed) then
+                    ClearPedTasks(passPed)
                 end
-            end
-
-            Wait(3000)
-
-            if DoesEntityExist(driverPed) and DoesEntityExist(vehicle) then
-                ClearPedTasks(driverPed)
-                TaskVehicleEscort(driverPed, vehicle, vehicle, -1, 35.0, 786988, 5.0, 0, 25.0)
-                SetVehicleEngineOn(vehicle, true, true, false)
-                TaskVehicleDriveWander(driverPed, vehicle, 35.0, 786988)
             end
         end
 
@@ -1187,7 +1170,8 @@ local function handleSupplierInteraction(driverPed)
 end
 
 -- ────────────────────────────────────────────────────────────────────────────
--- NORMAL VEHICLE BUYER INTERACTION (big buyer / undercover)
+-- VEHICLE BUYER INTERACTION (player approaches the vehicle)
+-- All occupants remain in the vehicle for the entire transaction.
 -- ────────────────────────────────────────────────────────────────────────────
 
 ---@param driverPed integer
@@ -1209,10 +1193,8 @@ local function onInteractWithVehicleBuyer(driverPed)
     end
 
     -- Normal buy behavior (big buyer / undercover)
+    -- Player approaches the vehicle window — driver stays seated
     if inNegotiation then return end
-
-    TaskTurnPedToFaceEntity(driverPed, cache.ped, 1000)
-    Wait(600)
 
     local acceptedPrice
     if Config.Negotiation.enabled then
@@ -1238,6 +1220,7 @@ local function onInteractWithVehicleBuyer(driverPed)
         return
     end
 
+    -- Window exchange animation (player only)
     local animCompleted = playSaleAnimation(driverPed)
     if not animCompleted then
         lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
@@ -1254,7 +1237,6 @@ local function onInteractWithVehicleBuyer(driverPed)
     end
 
     if result.result == 'risk_event' then
-        -- For undercover vehicles, show special notification
         if data.archetypeId == 'vehicle_undercover' then
             lib.notify({
                 title = 'Undercover!',
@@ -1279,7 +1261,6 @@ local function onInteractWithVehicleBuyer(driverPed)
                 patienceExpiry = data.patienceExpiry,
             })
         end
-        -- Drive away after risk event
         SetTimeout(5000, function()
             vehicleDriveAwayAndCleanup(driverPed)
         end)
@@ -1361,57 +1342,43 @@ local function startVehicleBuyerBehavior(driverPed, zoneConfig)
         startUndercoverDispatch(driverPed, data.zoneId)
     end
 
-    -- Phase 3: Robbery vehicles attack immediately
+    -- Phase 3: Wait in vehicle for player to approach
+    data.state = VehicleState.WAITING
+    data.patienceExpiry = GetGameTimer() + archetype.patienceMs
+
+    -- Robbery vehicles wait a moment then open fire if player is close
     if archetype.behavior == 'robbery' then
-        Wait(1500)
-        -- Passengers get out and attack
-        if data.passengers then
-            for i, passPed in ipairs(data.passengers) do
-                if DoesEntityExist(passPed) then
-                    TaskLeaveVehicle(passPed, vehicle, 256)
-                end
-            end
-        end
-        TaskLeaveVehicle(driverPed, vehicle, 256)
         Wait(2000)
-        handleRobberyBehavior(driverPed)
-        return
-    end
-
-    -- Phase 4: Driver exits vehicle
-    data.state = VehicleState.DRIVER_EXITING
-    TaskLeaveVehicle(driverPed, vehicle, 0)
-
-    local exitTimeout = GetGameTimer() + 8000
-    while IsPedInVehicle(driverPed, vehicle, false) and GetGameTimer() < exitTimeout do
-        Wait(300)
-    end
-
-    if not DoesEntityExist(driverPed) then
+        -- Check if player is within range, otherwise wait
+        local timeout = GetGameTimer() + archetype.patienceMs
+        while DoesEntityExist(driverPed) and DoesEntityExist(vehicle) do
+            local playerDist = #(GetEntityCoords(cache.ped) - GetEntityCoords(vehicle))
+            if playerDist < 8.0 then
+                handleRobberyBehavior(driverPed)
+                return
+            end
+            if GetGameTimer() > timeout then
+                vehicleDriveAwayAndCleanup(driverPed)
+                return
+            end
+            Wait(500)
+        end
         cleanupVehicleBuyer(driverPed)
         return
     end
 
-    -- Phase 5: Wait for player interaction
-    data.state = VehicleState.WAITING
-    data.patienceExpiry = GetGameTimer() + archetype.patienceMs
-
-    -- Idle near the vehicle
-    ClearPedTasks(driverPed)
-    SetBlockingOfNonTemporaryEvents(driverPed, true)
-
     lib.notify({
         title = 'Drug Zone',
-        description = ('A vehicle has pulled up... the driver wants to talk.'),
+        description = 'A vehicle has pulled up... approach the window.',
         type = 'inform', duration = 5000,
     })
 
-    -- Wait for interaction or patience to expire
+    -- Wait for player interaction or patience to expire
     while data.state == VehicleState.WAITING and DoesEntityExist(driverPed) do
         if GetGameTimer() > data.patienceExpiry then
             lib.notify({
                 title = 'Drug Zone',
-                description = 'The vehicle buyer got tired of waiting.',
+                description = 'The vehicle drove off — you took too long.',
                 type = 'inform',
             })
             vehicleDriveAwayAndCleanup(driverPed)
@@ -1518,6 +1485,9 @@ local function spawnVehicleBuyer(zoneConfig)
         patienceExpiry = 0,
     }
 
+    -- Register reverse lookup (vehicle -> driver) for interaction
+    vehicleToDriver[vehicle] = driver
+
     vehicleCooldowns[zoneConfig.id] = GetGameTimer() + vbSettings.cooldownMs
 
     -- Start behavior in separate thread
@@ -1556,16 +1526,21 @@ exports('IsDrugBuyer', function(pedEntity)
     return data ~= nil and data.state == PedState.WAITING
 end)
 
-exports('InteractVehicleBuyer', function(pedEntity)
-    local data = vehicleBuyers[pedEntity]
+--- Interact with a vehicle buyer. Accepts either a vehicle entity or driver ped.
+exports('InteractVehicleBuyer', function(entity)
+    -- Resolve to driver ped whether given vehicle or ped
+    local driverPed = vehicleToDriver[entity] or entity
+    local data = vehicleBuyers[driverPed]
     if data and data.state == VehicleState.WAITING then
-        onInteractWithVehicleBuyer(pedEntity)
+        onInteractWithVehicleBuyer(driverPed)
         return true
     end
     return false
 end)
 
-exports('IsVehicleBuyer', function(pedEntity)
-    local data = vehicleBuyers[pedEntity]
+--- Check if entity is a vehicle buyer. Accepts either a vehicle entity or driver ped.
+exports('IsVehicleBuyer', function(entity)
+    local driverPed = vehicleToDriver[entity] or entity
+    local data = vehicleBuyers[driverPed]
     return data ~= nil and data.state == VehicleState.WAITING
 end)

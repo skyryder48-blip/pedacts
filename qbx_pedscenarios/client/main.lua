@@ -52,34 +52,43 @@ end, false)
 
 lib.addKeybind({
     name = 'drug_deal_interact',
-    description = 'Interact with nearby drug buyer',
+    description = 'Interact with nearby drug buyer or vehicle',
     defaultKey = 'E',
     onPressed = function()
         if not initialized then return end
 
         local playerCoords = GetEntityCoords(cache.ped)
-        local closestPed, closestDist = nil, 3.0
+        local closestEntity, closestDist, interactionType = nil, 4.0, nil
 
+        -- Check foot buyers (peds)
         for _, ped in ipairs(GetGamePool('CPed')) do
             if ped ~= cache.ped and DoesEntityExist(ped) then
                 local dist = #(playerCoords - GetEntityCoords(ped))
-                if dist < closestDist then
-                    if exports.qbx_pedscenarios:IsDrugBuyer(ped) then
-                        closestPed = ped
-                        closestDist = dist
-                    elseif exports.qbx_pedscenarios:IsVehicleBuyer(ped) then
-                        closestPed = ped
-                        closestDist = dist
-                    end
+                if dist < closestDist and exports.qbx_pedscenarios:IsDrugBuyer(ped) then
+                    closestEntity = ped
+                    closestDist = dist
+                    interactionType = 'foot'
                 end
             end
         end
 
-        if closestPed then
-            if exports.qbx_pedscenarios:IsDrugBuyer(closestPed) then
-                exports.qbx_pedscenarios:InteractDrugBuyer(closestPed)
-            elseif exports.qbx_pedscenarios:IsVehicleBuyer(closestPed) then
-                exports.qbx_pedscenarios:InteractVehicleBuyer(closestPed)
+        -- Check vehicle buyers (vehicles)
+        for _, veh in ipairs(GetGamePool('CVehicle')) do
+            if DoesEntityExist(veh) then
+                local dist = #(playerCoords - GetEntityCoords(veh))
+                if dist < closestDist and exports.qbx_pedscenarios:IsVehicleBuyer(veh) then
+                    closestEntity = veh
+                    closestDist = dist
+                    interactionType = 'vehicle'
+                end
+            end
+        end
+
+        if closestEntity then
+            if interactionType == 'foot' then
+                exports.qbx_pedscenarios:InteractDrugBuyer(closestEntity)
+            elseif interactionType == 'vehicle' then
+                exports.qbx_pedscenarios:InteractVehicleBuyer(closestEntity)
             end
         end
     end,
@@ -89,8 +98,7 @@ lib.addKeybind({
 -- OX_TARGET INTEGRATION (optional - add interactions to scenario peds)
 -- ============================================================================
 
--- Drug buyer interaction target
--- This adds a targetable option to peds near drug zones
+-- Drug buyer interaction: foot buyers via addGlobalPed
 if GetResourceState('ox_target') == 'started' then
     exports.ox_target:addGlobalPed({
         {
@@ -105,11 +113,15 @@ if GetResourceState('ox_target') == 'started' then
                 exports.qbx_pedscenarios:InteractDrugBuyer(data.entity)
             end,
         },
+    })
+
+    -- Vehicle buyer interaction: target the vehicle, not the ped
+    exports.ox_target:addGlobalVehicle({
         {
             name = 'pedscenarios_vehicle_buyer_interact',
             icon = 'fas fa-car',
             label = 'Deal',
-            distance = 3.0,
+            distance = 4.0,
             canInteract = function(entity)
                 return exports.qbx_pedscenarios:IsVehicleBuyer(entity)
             end,
