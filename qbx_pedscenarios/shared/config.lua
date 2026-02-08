@@ -587,6 +587,37 @@ Config.Stealth = {
     suspicionBuildRate = 15.0,
     suspicionDecayRate = 5.0,
     suspicionThreshold = 100.0,
+
+    --- Guard field-of-view: dot product threshold for facing check.
+    --- -0.2 ≈ 100° cone in front of guard. Guards facing away can't detect visually.
+    guardFovDot = -0.2,
+
+    --- Fraction of suspicion carried forward on alert escalation (0 = full reset, 1 = keep all).
+    suspicionCarryForward = 0.3,
+
+    --- Disguise: suspicious behavior modifiers (weapon drawn, sprinting, crouching while disguised).
+    --- Guards within half detection range will accumulate suspicion at a reduced rate.
+    disguiseSuspicion = {
+        weaponDrawnMult = 3.0,    -- holding a weapon is very suspicious
+        sprintMult = 1.5,         -- sprinting in uniform attracts attention
+        crouchMult = 1.2,         -- crouching is mildly suspicious
+        rangeFraction = 0.5,      -- only guards within this fraction of detection range notice
+        buildRateFraction = 0.2,  -- base fraction of normal suspicion build rate
+    },
+}
+
+--- Player alert notifications: set enabled = false for pure visual immersion
+--- (no on-screen text when alert level changes). Players must rely on guard
+--- speech, behavior, and ambient audio cues.
+Config.AlertNotifications = {
+    enabled = false,
+}
+
+--- Guard respawn: dead post guards respawn after a cooldown when alert returns to patrol.
+--- Set delayMs high enough that heist players can finish before guards return.
+Config.GuardRespawn = {
+    enabled = true,
+    delayMs = 1800000, -- 30 minutes
 }
 
 -- ────────────────────────────────────────────────────────────────────────────

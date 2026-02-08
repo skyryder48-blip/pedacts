@@ -19,6 +19,7 @@ local reinforcementWave = {}    ---@type table<string, integer> -- zoneId -> cur
 local reinforcementsActive = {} ---@type table<string, boolean> -- zoneId -> post-exit reinforcement flag
 local playerAccess = {}         ---@type table<string, {type: string, expiry: integer}> -- zoneId -> access grant
 local keycardCache = {}         ---@type table<string, {result: boolean, expiry: integer}> -- zoneId -> cached check
+local deadPostGuards = {}       ---@type table<string, table[]> -- zoneId -> dead post guard info for respawn
 
 local interactWithObjective     -- forward declaration (defined after initObjectives)
 
@@ -35,6 +36,9 @@ local interactWithObjective     -- forward declaration (defined after initObject
 ---@field suspicion number -- per-guard suspicion accumulator toward player
 ---@field alerted boolean -- has this guard been radio-alerted by another guard
 ---@field alive boolean
+---@field deathPos? vector3 -- where the guard died (for body discovery)
+---@field bodyDiscovered? boolean -- has another guard found this body
+---@field postConfig? table -- original post config entry (for respawn)
 
 ---@class ZoneAlertData
 ---@field level AlertLevel
@@ -97,6 +101,20 @@ local function getNearestGuard(zoneId)
     return nearest
 end
 
+--- Check if a ped is facing toward a target position (horizontal plane).
+---@param ped integer
+---@param targetPos vector3
+---@return boolean
+local function isPedFacingPosition(ped, targetPos)
+    local pedCoords = GetEntityCoords(ped)
+    local fwd = GetEntityForwardVector(ped)
+    local dir = targetPos - pedCoords
+    local len = math.sqrt(dir.x * dir.x + dir.y * dir.y)
+    if len < 0.01 then return true end
+    local dot = (fwd.x * dir.x + fwd.y * dir.y) / len
+    return dot >= (Config.Stealth.guardFovDot or -0.2)
+end
+
 ---@param zoneId string
 ---@param newLevel AlertLevel
 ---@param playerPos? vector3
@@ -127,8 +145,8 @@ local function setAlertLevel(zoneId, newLevel, playerPos)
         end
     end
 
-    -- Notification for player
-    if alertOrder(newLevel) > alertOrder(oldLevel) then
+    -- Notification for player (configurable — disable for pure visual immersion)
+    if Config.AlertNotifications and Config.AlertNotifications.enabled and alertOrder(newLevel) > alertOrder(oldLevel) then
         local msgs = {
             suspicious = { title = 'Security', desc = 'Something caught their attention...', type = 'warning' },
             alert = { title = 'ALERT', desc = 'Guards are searching for an intruder!', type = 'error' },
@@ -382,6 +400,7 @@ local function spawnPostGuard(post, zoneId, zoneConfig)
         zoneId = zoneId,
         archetypeId = archetypeId,
         role = 'post',
+        postConfig = post,
         suspicion = 0,
         alerted = false,
         alive = true,
@@ -760,6 +779,24 @@ interactWithObjective = function(zoneId, objDef)
         return
     end
 
+    if result.error == 'alert_too_high' then
+        lib.notify({
+            title = 'Too Dangerous',
+            description = 'Can\'t do this while guards are on high alert!',
+            type = 'error',
+        })
+        return
+    end
+
+    if result.error == 'inventory_full' then
+        lib.notify({
+            title = objDef.label,
+            description = 'Your inventory is full. Make room first.',
+            type = 'error',
+        })
+        return
+    end
+
     if result.result == 'success' then
         local lootDesc = ''
         if result.loot and #result.loot > 0 then
@@ -777,6 +814,19 @@ interactWithObjective = function(zoneId, objDef)
             description = ('Success! Got: %s'):format(lootDesc),
             type = 'success', duration = 5000,
         })
+
+        -- Notify about dropped overflow
+        if result.droppedLoot and #result.droppedLoot > 0 then
+            local dropParts = {}
+            for _, l in ipairs(result.droppedLoot) do
+                dropParts[#dropParts + 1] = ('%dx %s'):format(l.quantity, l.item)
+            end
+            lib.notify({
+                title = 'Inventory Full',
+                description = ('Dropped on ground: %s'):format(table.concat(dropParts, ', ')),
+                type = 'warning', duration = 5000,
+            })
+        end
     end
 end
 
@@ -816,13 +866,33 @@ local function detectionTick(zoneId, zoneConfig)
 
     -- Check for player access (disguise/keycard/vehicle)
     local hasAccess, accessType = checkPlayerAccess(zoneId, zoneConfig)
+    local disguiseSuspicious = false
+    local disguiseSuspMult = 0
+
     if hasAccess then
-        -- Player has access: slowly decay suspicion
-        state.suspicionPool = math.max(state.suspicionPool - Config.Stealth.suspicionDecayRate * 2, 0)
-        return
+        if accessType == 'disguise' then
+            local ds = Config.Stealth.disguiseSuspicion
+            if ds then
+                if IsPedArmed(cache.ped, 4) then
+                    disguiseSuspicious = true
+                    disguiseSuspMult = ds.weaponDrawnMult
+                elseif IsPedSprinting(cache.ped) then
+                    disguiseSuspicious = true
+                    disguiseSuspMult = ds.sprintMult
+                elseif GetPedStealthMovement(cache.ped) then
+                    disguiseSuspicious = true
+                    disguiseSuspMult = ds.crouchMult
+                end
+            end
+        end
+
+        if not disguiseSuspicious then
+            state.suspicionPool = math.max(state.suspicionPool - Config.Stealth.suspicionDecayRate * 2, 0)
+            return
+        end
     end
 
-    -- Check for noise events (instant escalation)
+    -- Check for noise events (instant escalation — ignores disguise)
     local noiseTriggered, noisePos = checkNoiseEvents(zoneId, zoneConfig)
     if noiseTriggered then
         if alertOrder(level) < alertOrder('alert') then
@@ -835,20 +905,48 @@ local function detectionTick(zoneId, zoneConfig)
         return
     end
 
-    -- Check guard-by-guard detection
+    -- Body discovery: alive guards discover dead bodies via LOS + facing
+    for deadPed, deadData in pairs(secGuards) do
+        if deadData.zoneId == zoneId and not deadData.alive and deadData.deathPos and not deadData.bodyDiscovered then
+            for alivePed, aliveData in pairs(secGuards) do
+                if aliveData.zoneId == zoneId and aliveData.alive and DoesEntityExist(alivePed) then
+                    local dist = #(deadData.deathPos - GetEntityCoords(alivePed))
+                    if dist < zoneConfig.detectionRadius
+                        and isPedFacingPosition(alivePed, deadData.deathPos)
+                        and HasEntityClearLosToEntity(alivePed, deadPed, 17) then
+                        deadData.bodyDiscovered = true
+                        -- Guards investigate the BODY location, not the player
+                        if alertOrder(level) < alertOrder('alert') then
+                            setAlertLevel(zoneId, 'alert', deadData.deathPos)
+                            applyAlertBehavior(zoneId, zoneConfig)
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Guard-by-guard detection
     local anyDetected = false
     local thresholdMult = zoneConfig.alertOverrides and zoneConfig.alertOverrides.suspicionThresholdMult or 1.0
     local effectiveThreshold = Config.Stealth.suspicionThreshold * thresholdMult
 
     for ped, data in pairs(secGuards) do
         if data.zoneId ~= zoneId or not data.alive or not DoesEntityExist(ped) then
-            -- Check if guard died
-            if DoesEntityExist(ped) and IsPedDeadOrDying(ped, true) then
+            -- Mark dead guards (don't escalate — body discovery handles that)
+            if data.alive and DoesEntityExist(ped) and IsPedDeadOrDying(ped, true) then
                 data.alive = false
-                -- Dead guard found = instant alert escalation
-                if alertOrder(level) < alertOrder('alert') then
-                    setAlertLevel(zoneId, 'alert', GetEntityCoords(ped))
-                    applyAlertBehavior(zoneId, zoneConfig)
+                data.deathPos = GetEntityCoords(ped)
+
+                -- Track dead post guards for respawn
+                if data.role == 'post' and data.postConfig then
+                    deadPostGuards[zoneId] = deadPostGuards[zoneId] or {}
+                    deadPostGuards[zoneId][#deadPostGuards[zoneId] + 1] = {
+                        post = data.postConfig,
+                        archetypeId = data.archetypeId,
+                        diedAt = GetGameTimer(),
+                    }
                 end
             end
             goto nextGuard
@@ -858,13 +956,28 @@ local function detectionTick(zoneId, zoneConfig)
         local dist = #(playerCoords - pedCoords)
         local effectiveRange = calculateDetectionRange(ped, zoneConfig.detectionRadius, zoneId)
 
+        -- Disguised players only detected at closer range
+        if disguiseSuspicious then
+            local ds = Config.Stealth.disguiseSuspicion
+            effectiveRange = effectiveRange * (ds and ds.rangeFraction or 0.5)
+        end
+
         if dist < effectiveRange then
             local hasLOS = HasEntityClearLosToEntity(ped, cache.ped, 17)
+            local isFacing = isPedFacingPosition(ped, playerCoords)
 
-            if hasLOS then
+            if hasLOS and isFacing then
                 anyDetected = true
                 state.lastKnownPlayerPos = playerCoords
-                data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate
+
+                -- Build suspicion (modified by disguise)
+                if disguiseSuspicious then
+                    local ds = Config.Stealth.disguiseSuspicion
+                    local rate = Config.Stealth.suspicionBuildRate * (ds and ds.buildRateFraction or 0.2) * disguiseSuspMult
+                    data.suspicion = data.suspicion + rate
+                else
+                    data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate
+                end
 
                 -- Check if player attacked any guard
                 if HasEntityBeenDamagedByEntity(ped, cache.ped, true) then
@@ -876,8 +989,11 @@ local function detectionTick(zoneId, zoneConfig)
                         return
                     end
                 end
+            elseif hasLOS and not isFacing then
+                -- Guard has LOS but isn't looking: very slow suspicion (peripheral awareness)
+                data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.1
             else
-                -- No LOS: slower suspicion with behind-cover modifier
+                -- No LOS: behind-cover logic
                 if dist < effectiveRange * Config.Stealth.behindCoverModifier then
                     data.suspicion = data.suspicion + Config.Stealth.suspicionBuildRate * 0.3
                 else
@@ -907,10 +1023,11 @@ local function detectionTick(zoneId, zoneConfig)
             setAlertLevel(zoneId, alertCfg.transitionTo, state.lastKnownPlayerPos)
             resetGuardAlerts(zoneId)
             applyAlertBehavior(zoneId, zoneConfig)
-            state.suspicionPool = 0
-            -- Reset individual suspicion
+            -- Carry forward fraction of suspicion instead of full reset
+            local carry = Config.Stealth.suspicionCarryForward or 0.3
+            state.suspicionPool = state.suspicionPool * carry
             for _, data in pairs(secGuards) do
-                if data.zoneId == zoneId then data.suspicion = 0 end
+                if data.zoneId == zoneId then data.suspicion = data.suspicion * carry end
             end
         end
     end
@@ -930,6 +1047,23 @@ local function detectionTick(zoneId, zoneConfig)
                     end
                 end
             end
+        end
+    end
+
+    -- Post guard respawn: check if dead post guards should respawn
+    if level == 'patrol' and Config.GuardRespawn and Config.GuardRespawn.enabled and deadPostGuards[zoneId] then
+        local respawnDelay = Config.GuardRespawn.delayMs or 1800000
+        local now = GetGameTimer()
+        local toRemove = {}
+        for i, dead in ipairs(deadPostGuards[zoneId]) do
+            if now - dead.diedAt >= respawnDelay then
+                spawnPostGuard(dead.post, zoneId, zoneConfig)
+                toRemove[#toRemove + 1] = i
+                lib.print.info(('Respawned post guard at zone "%s"'):format(zoneId))
+            end
+        end
+        for j = #toRemove, 1, -1 do
+            table.remove(deadPostGuards[zoneId], toRemove[j])
         end
     end
 end
@@ -991,6 +1125,7 @@ function InitSecurityZones()
             onEnter = function()
                 secZoneActive[zoneId] = true
                 reinforcementsActive[zoneId] = nil -- cancel any lingering post-exit reinforcement
+                deadPostGuards[zoneId] = nil
                 playerAccess[zoneId] = nil
                 keycardCache[zoneId] = nil
 
@@ -1155,4 +1290,5 @@ function CleanupSecurityZones()
     reinforcementWave = {}
     playerAccess = {}
     keycardCache = {}
+    deadPostGuards = {}
 end

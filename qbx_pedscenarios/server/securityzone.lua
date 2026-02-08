@@ -152,18 +152,67 @@ lib.callback.register('qbx_pedscenarios:server:attemptObjective', function(sourc
         end
     end
 
-    -- Give loot to player
+    -- Check if player can carry at least one item
+    if #loot > 0 then
+        local canCarryAny = false
+        for _, entry in ipairs(loot) do
+            if exports.ox_inventory:CanCarryItem(source, entry.item, 1) then
+                canCarryAny = true
+                break
+            end
+        end
+        if not canCarryAny then
+            return { error = 'inventory_full' }
+        end
+    end
+
+    -- Give loot to player, drop overflow on the ground
     local givenItems = {}
+    local droppedItems = {}
     for _, lootEntry in ipairs(loot) do
         local success = exports.ox_inventory:AddItem(source, lootEntry.item, lootEntry.quantity)
         if success then
             givenItems[#givenItems + 1] = lootEntry
+        else
+            -- Try smaller quantities
+            local carried = 0
+            for qty = lootEntry.quantity - 1, 1, -1 do
+                if exports.ox_inventory:AddItem(source, lootEntry.item, qty) then
+                    carried = qty
+                    givenItems[#givenItems + 1] = { item = lootEntry.item, quantity = qty }
+                    break
+                end
+            end
+            local remainder = lootEntry.quantity - carried
+            if remainder > 0 then
+                droppedItems[#droppedItems + 1] = { item = lootEntry.item, quantity = remainder }
+            end
         end
     end
 
-    -- Set cooldown
-    if not objectiveCooldowns[citizenid] then objectiveCooldowns[citizenid] = {} end
-    objectiveCooldowns[citizenid][objectiveId] = os.time() + math.floor(objDef.cooldownMs / 1000)
+    -- Drop overflow items on the ground near the player
+    if #droppedItems > 0 then
+        local playerPed = GetPlayerPed(source)
+        if playerPed ~= 0 then
+            local coords = GetEntityCoords(playerPed)
+            local dropItems = {}
+            for _, entry in ipairs(droppedItems) do
+                dropItems[#dropItems + 1] = { entry.item, entry.quantity }
+            end
+            local ok, err = pcall(function()
+                exports.ox_inventory:CustomDrop('seczone_loot', dropItems, coords)
+            end)
+            if not ok then
+                lib.print.warn(('Could not create ground drop for overflow loot: %s'):format(tostring(err)))
+            end
+        end
+    end
+
+    -- Set cooldown only after successful loot
+    if #givenItems > 0 or #loot == 0 then
+        if not objectiveCooldowns[citizenid] then objectiveCooldowns[citizenid] = {} end
+        objectiveCooldowns[citizenid][objectiveId] = os.time() + math.floor(objDef.cooldownMs / 1000)
+    end
 
     -- Award free-gangs reputation for completing objective
     if #givenItems > 0 then
@@ -176,6 +225,7 @@ lib.callback.register('qbx_pedscenarios:server:attemptObjective', function(sourc
     return {
         result = 'success',
         loot = givenItems,
+        droppedLoot = droppedItems,
     }
 end)
 
