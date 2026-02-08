@@ -14,8 +14,13 @@ local secZoneActive = {}        ---@type table<string, boolean>
 local secGuards = {}            ---@type table<integer, GuardData>
 local zoneAlertState = {}       ---@type table<string, ZoneAlertData>
 local zoneObjectiveProps = {}   ---@type table<string, integer[]> -- zoneId -> prop handles
+local zoneTargetZones = {}      ---@type table<string, integer[]> -- zoneId -> ox_target zone ids
 local reinforcementWave = {}    ---@type table<string, integer> -- zoneId -> current wave index
+local reinforcementsActive = {} ---@type table<string, boolean> -- zoneId -> post-exit reinforcement flag
 local playerAccess = {}         ---@type table<string, {type: string, expiry: integer}> -- zoneId -> access grant
+local keycardCache = {}         ---@type table<string, {result: boolean, expiry: integer}> -- zoneId -> cached check
+
+local interactWithObjective     -- forward declaration (defined after initObjectives)
 
 -- ============================================================================
 -- TYPES
@@ -102,7 +107,6 @@ local function setAlertLevel(zoneId, newLevel, playerPos)
     local oldLevel = state.level
     if oldLevel == newLevel then return end
 
-    -- Only escalate, never skip levels (except decay)
     state.level = newLevel
     state.levelChangedAt = GetGameTimer()
 
@@ -200,11 +204,29 @@ local function checkNoiseEvents(zoneId, zoneConfig)
 
     -- Check if player fired a weapon recently
     if IsPedShooting(cache.ped) then
-        -- Any guard within gunshot range is instantly alerted
         for ped, data in pairs(secGuards) do
             if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
                 if #(playerCoords - GetEntityCoords(ped)) < st.gunshotDetectionRange then
                     return true, playerCoords
+                end
+            end
+        end
+    end
+
+    -- Check for nearby explosions (type -1 = any explosion type)
+    if IsExplosionInSphere(-1, playerCoords.x, playerCoords.y, playerCoords.z, st.explosionDetectionRange) then
+        return true, playerCoords
+    end
+
+    -- Check if player is honking a vehicle horn
+    if IsPedInAnyVehicle(cache.ped, false) then
+        local veh = GetVehiclePedIsIn(cache.ped, false)
+        if IsHornActive(veh) then
+            for ped, data in pairs(secGuards) do
+                if data.zoneId == zoneId and data.alive and DoesEntityExist(ped) then
+                    if #(playerCoords - GetEntityCoords(ped)) < st.vehicleHornRange then
+                        return true, playerCoords
+                    end
                 end
             end
         end
@@ -276,23 +298,30 @@ local function checkPlayerAccess(zoneId, zoneConfig)
         end
     end
 
-    -- Check keycards (async server check, but we cache the result)
+    -- Check keycards (server check cached with short TTL to avoid blocking detection loop)
     if access.keycards then
-        for _, keycard in ipairs(access.keycards) do
-            local hasItem = lib.callback.await('qbx_pedscenarios:server:checkAccessItem', false, keycard.item)
-            if hasItem then
-                local expiry = keycard.grantDurationMs > 0
-                    and (GetGameTimer() + keycard.grantDurationMs)
-                    or 0
+        local cached = keycardCache[zoneId]
+        if cached and GetGameTimer() < cached.expiry then
+            if cached.result then return true, 'keycard' end
+        else
+            for _, keycard in ipairs(access.keycards) do
+                local hasItem = lib.callback.await('qbx_pedscenarios:server:checkAccessItem', false, keycard.item)
+                if hasItem then
+                    local grantExpiry = keycard.grantDurationMs > 0
+                        and (GetGameTimer() + keycard.grantDurationMs)
+                        or 0
 
-                playerAccess[zoneId] = { type = 'keycard', expiry = expiry }
+                    playerAccess[zoneId] = { type = 'keycard', expiry = grantExpiry }
+                    keycardCache[zoneId] = { result = true, expiry = GetGameTimer() + 5000 }
 
-                if keycard.consumeOnUse then
-                    lib.callback.await('qbx_pedscenarios:server:consumeAccessItem', false, keycard.item)
+                    if keycard.consumeOnUse then
+                        lib.callback.await('qbx_pedscenarios:server:consumeAccessItem', false, keycard.item)
+                    end
+
+                    return true, 'keycard'
                 end
-
-                return true, 'keycard'
             end
+            keycardCache[zoneId] = { result = false, expiry = GetGameTimer() + 3000 }
         end
     end
 
@@ -326,7 +355,7 @@ local function configureGuard(ped, archetype, zoneConfig)
     GivePedLoadout(ped, weapon)
 
     -- Set relationship group
-    SetPedRelationshipGroupHash(ped, `YOURFRIENDLYGROUP`)
+    SetPedRelationshipGroupHash(ped, `SECURITY_GUARD`)
 end
 
 ---@param post table
@@ -405,20 +434,23 @@ local function spawnPatrolGuard(patrol, zoneId, zoneConfig)
             TaskGoStraightToCoord(ped, wp.x, wp.y, wp.z, patrol.speed, -1, wp.w, 0.5)
             SetPedKeepTask(ped, true)
 
-            -- Wait until arrival or zone state change
+            -- Wait until arrival, zone state change, or timeout (30s)
+            local wpDeadline = GetGameTimer() + 30000
             repeat
                 Wait(1000)
                 if not DoesEntityExist(ped) or not secZoneActive[zoneId] then return end
                 if getAlertLevel(zoneId) == 'combat' or getAlertLevel(zoneId) == 'alert' then goto continue end
-            until #(GetEntityCoords(ped) - vec3(wp.x, wp.y, wp.z)) < 2.0
+            until #(GetEntityCoords(ped) - vec3(wp.x, wp.y, wp.z)) < 2.0 or GetGameTimer() > wpDeadline
 
             -- Routine steps at waypoint
             if patrol.routineSteps and #patrol.routineSteps > 0 and math.random() < 0.4 then
                 local step = PickRandom(patrol.routineSteps)
                 if step.coords then
                     TaskGoStraightToCoord(ped, step.coords.x, step.coords.y, step.coords.z, 1.0, -1, step.coords.w, 0.5)
+                    local stepDeadline = GetGameTimer() + 15000
                     repeat Wait(500) until not DoesEntityExist(ped) or not secZoneActive[zoneId]
                         or #(GetEntityCoords(ped) - vec3(step.coords.x, step.coords.y, step.coords.z)) < 2.0
+                        or GetGameTimer() > stepDeadline
                 end
 
                 if DoesEntityExist(ped) and secZoneActive[zoneId] and getAlertLevel(zoneId) == 'patrol' then
@@ -455,8 +487,16 @@ local function spawnReinforcementWave(wave, zoneId, zoneConfig)
         local y = zoneConfig.zone.coords.y + math.sin(angle) * dist
         local z = zoneConfig.zone.coords.z
 
-        local found, groundZ = GetGroundZFor_3dCoord(x, y, z + 50.0, false)
-        if found then z = groundZ end
+        -- Use GetSafeCoordForPed for a walkable position, fall back to collision probe
+        local safeFound, safeX, safeY, safeZ = GetSafeCoordForPed(x, y, z, true, 16)
+        if safeFound then
+            x, y, z = safeX, safeY, safeZ
+        else
+            RequestCollisionAtCoord(x, y, z)
+            Wait(200)
+            local found, groundZ = GetGroundZFor_3dCoord(x, y, z + 100.0, false)
+            if found then z = groundZ end
+        end
 
         local modelHash = PickRandom(archetype.pedModels)
         local ped = SpawnScenarioPed(modelHash, vec3(x, y, z), 0.0, 0)
@@ -464,7 +504,7 @@ local function spawnReinforcementWave(wave, zoneId, zoneConfig)
             configureGuard(ped, archetype, zoneConfig)
 
             -- Immediately hostile
-            local hostileGroup = `YOURFRIENDLYGROUP`
+            local hostileGroup = `SECURITY_GUARD`
             SetPedRelationshipGroupHash(ped, hostileGroup)
             TaskCombatPed(ped, cache.ped, 0, 16)
             SetPedKeepTask(ped, true)
@@ -549,7 +589,7 @@ local function applyAlertBehavior(zoneId, zoneConfig)
             if not data.alerted then
                 data.alerted = true
                 ClearPedTasks(ped)
-                local hostileGroup = `YOURFRIENDLYGROUP`
+                local hostileGroup = `SECURITY_GUARD`
                 SetRelationshipBetweenGroups(5, hostileGroup, `PLAYER`)
                 SetRelationshipBetweenGroups(5, `PLAYER`, hostileGroup)
                 SetPedRelationshipGroupHash(ped, hostileGroup)
@@ -589,6 +629,7 @@ local function initObjectives(zoneId, zoneConfig)
     if not zoneConfig.objectives or #zoneConfig.objectives == 0 then return end
 
     zoneObjectiveProps[zoneId] = {}
+    zoneTargetZones[zoneId] = {}
 
     for _, obj in ipairs(zoneConfig.objectives) do
         -- Spawn prop if defined
@@ -607,7 +648,7 @@ local function initObjectives(zoneId, zoneConfig)
 
         -- Register ox_target zone for this objective
         if GetResourceState('ox_target') == 'started' then
-            exports.ox_target:addSphereZone({
+            local targetId = exports.ox_target:addSphereZone({
                 coords = vec3(obj.coords.x, obj.coords.y, obj.coords.z),
                 radius = 1.2,
                 debug = Config.Debug,
@@ -618,7 +659,6 @@ local function initObjectives(zoneId, zoneConfig)
                         label = obj.label,
                         distance = 2.0,
                         canInteract = function()
-                            -- Check alert level constraint
                             if obj.maxAlertLevel then
                                 local current = getAlertLevel(zoneId)
                                 if alertOrder(current) > alertOrder(obj.maxAlertLevel) then
@@ -633,6 +673,9 @@ local function initObjectives(zoneId, zoneConfig)
                     },
                 },
             })
+            if targetId then
+                zoneTargetZones[zoneId][#zoneTargetZones[zoneId] + 1] = targetId
+            end
         end
     end
 end
@@ -640,7 +683,7 @@ end
 --- Handle objective interaction: check, animate, reward
 ---@param zoneId string
 ---@param objDef table
-function interactWithObjective(zoneId, objDef)
+interactWithObjective = function(zoneId, objDef)
     -- Check cooldown first
     local cdCheck = lib.callback.await('qbx_pedscenarios:server:checkObjectiveCooldown', false, objDef.id)
     if cdCheck and not cdCheck.available then
@@ -689,8 +732,9 @@ function interactWithObjective(zoneId, objDef)
         return
     end
 
-    -- Server processes the objective (validates items, rolls loot, applies cooldown)
-    local result = lib.callback.await('qbx_pedscenarios:server:attemptObjective', false, objDef.id)
+    -- Server processes the objective (validates items, alert level, rolls loot, applies cooldown)
+    local result = lib.callback.await('qbx_pedscenarios:server:attemptObjective', false,
+        zoneId, objDef.id, getAlertLevel(zoneId))
 
     if not result then
         lib.notify({ title = objDef.label, description = 'Failed.', type = 'error' })
@@ -739,6 +783,15 @@ end
 --- Cleanup objective props and ox_target zones
 ---@param zoneId string
 local function cleanupObjectives(zoneId)
+    -- Remove ox_target sphere zones
+    if zoneTargetZones[zoneId] and GetResourceState('ox_target') == 'started' then
+        for _, targetId in ipairs(zoneTargetZones[zoneId]) do
+            exports.ox_target:removeZone(targetId)
+        end
+        zoneTargetZones[zoneId] = nil
+    end
+
+    -- Remove objective props
     if zoneObjectiveProps[zoneId] then
         for _, prop in ipairs(zoneObjectiveProps[zoneId]) do
             if DoesEntityExist(prop) then DeleteObject(prop) end
@@ -937,7 +990,9 @@ function InitSecurityZones()
 
             onEnter = function()
                 secZoneActive[zoneId] = true
+                reinforcementsActive[zoneId] = nil -- cancel any lingering post-exit reinforcement
                 playerAccess[zoneId] = nil
+                keycardCache[zoneId] = nil
 
                 -- Initialize alert state
                 zoneAlertState[zoneId] = {
@@ -949,6 +1004,18 @@ function InitSecurityZones()
                 }
 
                 lib.print.info(('Entered security zone: %s'):format(config.label))
+
+                -- Show trespass warning if player doesn't have access
+                if config.warningMessage then
+                    local hasAccess = checkPlayerAccess(zoneId, config)
+                    if not hasAccess then
+                        lib.notify({
+                            title = config.label,
+                            description = config.warningMessage,
+                            type = 'warning', duration = 5000,
+                        })
+                    end
+                end
 
                 -- Spawn post guards
                 for _, post in ipairs(config.posts) do
@@ -983,29 +1050,79 @@ function InitSecurityZones()
             onExit = function()
                 secZoneActive[zoneId] = false
                 playerAccess[zoneId] = nil
+                keycardCache[zoneId] = nil
 
                 lib.print.info(('Exited security zone: %s'):format(config.label))
 
-                -- Reset relationships
-                SetRelationshipBetweenGroups(1, `YOURFRIENDLYGROUP`, `PLAYER`)
-                SetRelationshipBetweenGroups(1, `PLAYER`, `YOURFRIENDLYGROUP`)
-
-                -- Cleanup objectives
+                -- Cleanup objectives (props + ox_target zones)
                 cleanupObjectives(zoneId)
 
-                -- Delayed guard cleanup
-                SetTimeout(8000, function()
-                    if not secZoneActive[zoneId] then
-                        for ped, data in pairs(secGuards) do
-                            if data.zoneId == zoneId then
-                                RemoveScenarioPed(ped)
-                                secGuards[ped] = nil
+                local state = zoneAlertState[zoneId]
+                local inCombat = state and state.level == 'combat'
+
+                if inCombat and config.reinforcements and config.reinforcements.enabled then
+                    -- Keep relationships hostile while reinforcements are still arriving
+                    reinforcementsActive[zoneId] = true
+
+                    -- Continue spawning remaining reinforcement waves
+                    CreateThread(function()
+                        local currentWave = reinforcementWave[zoneId] or 0
+                        local cfg = config.reinforcements
+
+                        while reinforcementsActive[zoneId]
+                            and currentWave < cfg.maxWaves
+                            and currentWave < #cfg.waves do
+                            Wait(2000)
+                            if secZoneActive[zoneId] then return end -- player re-entered, abort
+                            if not state.combatStartedAt then break end
+
+                            local elapsed = GetGameTimer() - state.combatStartedAt
+                            local nextWave = cfg.waves[currentWave + 1]
+                            if elapsed >= nextWave.delayMs then
+                                currentWave = currentWave + 1
+                                reinforcementWave[zoneId] = currentWave
+                                spawnReinforcementWave(nextWave, zoneId, config)
                             end
                         end
-                        zoneAlertState[zoneId] = nil
-                        reinforcementWave[zoneId] = nil
-                    end
-                end)
+
+                        reinforcementsActive[zoneId] = nil
+
+                        -- Let combat play out before releasing guards
+                        Wait(30000)
+
+                        if not secZoneActive[zoneId] then
+                            SetRelationshipBetweenGroups(1, `SECURITY_GUARD`, `PLAYER`)
+                            SetRelationshipBetweenGroups(1, `PLAYER`, `SECURITY_GUARD`)
+
+                            for ped, data in pairs(secGuards) do
+                                if data.zoneId == zoneId then
+                                    ReleaseScenarioPed(ped)
+                                    secGuards[ped] = nil
+                                end
+                            end
+                            zoneAlertState[zoneId] = nil
+                            reinforcementWave[zoneId] = nil
+                        end
+                    end)
+                else
+                    -- No combat: reset relationships immediately
+                    SetRelationshipBetweenGroups(1, `SECURITY_GUARD`, `PLAYER`)
+                    SetRelationshipBetweenGroups(1, `PLAYER`, `SECURITY_GUARD`)
+
+                    -- Delayed release (not delete) so guards don't pop out of existence
+                    SetTimeout(8000, function()
+                        if not secZoneActive[zoneId] then
+                            for ped, data in pairs(secGuards) do
+                                if data.zoneId == zoneId then
+                                    ReleaseScenarioPed(ped)
+                                    secGuards[ped] = nil
+                                end
+                            end
+                            zoneAlertState[zoneId] = nil
+                            reinforcementWave[zoneId] = nil
+                        end
+                    end)
+                end
             end,
         }
 
@@ -1016,10 +1133,12 @@ end
 function CleanupSecurityZones()
     for id, zone in pairs(secZones) do
         secZoneActive[id] = false
+        reinforcementsActive[id] = nil
         zone:remove()
     end
     secZones = {}
 
+    -- Full cleanup (resource stop / logout): hard-delete peds
     for ped in pairs(secGuards) do
         RemoveScenarioPed(ped)
     end
@@ -1029,7 +1148,11 @@ function CleanupSecurityZones()
         cleanupObjectives(zoneId)
     end
 
+    SetRelationshipBetweenGroups(1, `SECURITY_GUARD`, `PLAYER`)
+    SetRelationshipBetweenGroups(1, `PLAYER`, `SECURITY_GUARD`)
+
     zoneAlertState = {}
     reinforcementWave = {}
     playerAccess = {}
+    keycardCache = {}
 end

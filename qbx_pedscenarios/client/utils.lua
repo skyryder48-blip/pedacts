@@ -59,13 +59,25 @@ function SpawnScenarioPed(modelHash, coords, heading, zoneId)
     return ped
 end
 
---- Clean up a single ped
+--- Clean up a single ped (hard delete)
 ---@param ped integer
 function RemoveScenarioPed(ped)
     if DoesEntityExist(ped) then
         ClearPedTasks(ped)
         SetEntityAsMissionEntity(ped, false, true)
         DeleteEntity(ped)
+    end
+    activePeds[ped] = nil
+end
+
+--- Release a ped back to the game engine without deleting it.
+--- The ped stays in the world and will despawn naturally when the player moves away.
+---@param ped integer
+function ReleaseScenarioPed(ped)
+    if DoesEntityExist(ped) then
+        SetBlockingOfNonTemporaryEvents(ped, false)
+        SetPedKeepTask(ped, false)
+        SetEntityAsMissionEntity(ped, false, true)
     end
     activePeds[ped] = nil
 end

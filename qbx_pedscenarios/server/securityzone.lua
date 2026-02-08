@@ -57,11 +57,13 @@ local function getCitizenId(source)
     return player and player.PlayerData.citizenid or nil
 end
 
+--- Find an objective definition scoped to a specific zone
+---@param zoneId string
 ---@param objectiveId string
 ---@return table?
-local function findObjectiveDef(objectiveId)
+local function findObjectiveDef(zoneId, objectiveId)
     for _, zone in ipairs(Config.SecurityZones) do
-        if zone.objectives then
+        if zone.id == zoneId and zone.objectives then
             for _, obj in ipairs(zone.objectives) do
                 if obj.id == objectiveId then
                     return obj
@@ -89,16 +91,27 @@ lib.callback.register('qbx_pedscenarios:server:consumeAccessItem', function(sour
 end)
 
 --- Validate and process an objective interaction
---- Checks: player has required item, cooldown is clear, rolls loot.
-lib.callback.register('qbx_pedscenarios:server:attemptObjective', function(source, objectiveId)
+--- Checks: zone match, alert level, required item, cooldown, then rolls loot.
+lib.callback.register('qbx_pedscenarios:server:attemptObjective', function(source, zoneId, objectiveId, alertLevel)
     local player = exports.qbx_core:GetPlayer(source)
     if not player then return { error = 'no_player' } end
 
     local citizenid = player.PlayerData.citizenid
     if not citizenid then return { error = 'no_citizen' } end
 
-    local objDef = findObjectiveDef(objectiveId)
+    if not zoneId or not objectiveId then return { error = 'invalid_params' } end
+
+    local objDef = findObjectiveDef(zoneId, objectiveId)
     if not objDef then return { error = 'invalid_objective' } end
+
+    -- Server-side alert level validation
+    if objDef.maxAlertLevel and alertLevel then
+        local objMaxOrder = Config.AlertLevelOrder[objDef.maxAlertLevel] or 0
+        local currentOrder = Config.AlertLevelOrder[alertLevel] or 0
+        if currentOrder > objMaxOrder then
+            return { error = 'alert_too_high' }
+        end
+    end
 
     -- Check cooldown
     if objectiveCooldowns[citizenid] and objectiveCooldowns[citizenid][objectiveId] then
