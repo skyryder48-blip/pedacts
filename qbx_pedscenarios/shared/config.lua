@@ -45,12 +45,6 @@ Config.PedModels = {
         `s_m_y_marine_02`,
         `s_m_y_marine_03`,
     },
-    bodyguards = {
-        `s_m_m_bouncer_01`,
-        `s_m_m_security_01`,
-        `a_m_y_musclbeac_02`,
-        `g_m_m_armboss_01`,
-    },
 }
 
 -- ============================================================================
@@ -478,6 +472,13 @@ Config.DrugZones = {
             vec4(105.0, -1978.0, 21.1, 45.0),
             vec4(120.0, -1960.0, 21.1, 270.0),
         },
+        vehicleBuyer = {
+            enabled = true,
+            maxVehicles = 1,
+            cooldownMs = 45000,
+            spawnDistance = 80.0,
+            parkDistance = 15.0,
+        },
     },
     {
         id = 'strawberry_ave',
@@ -494,6 +495,13 @@ Config.DrugZones = {
         cooldownPerPedMs = 25000,
         items = { 'weed_brick', 'crack', 'oxy' },
         spawnPoints = {},
+        vehicleBuyer = {
+            enabled = true,
+            maxVehicles = 1,
+            cooldownMs = 55000,
+            spawnDistance = 70.0,
+            parkDistance = 12.0,
+        },
     },
 }
 
@@ -579,6 +587,37 @@ Config.Stealth = {
     suspicionBuildRate = 15.0,
     suspicionDecayRate = 5.0,
     suspicionThreshold = 100.0,
+
+    --- Guard field-of-view: dot product threshold for facing check.
+    --- -0.2 ≈ 100° cone in front of guard. Guards facing away can't detect visually.
+    guardFovDot = -0.2,
+
+    --- Fraction of suspicion carried forward on alert escalation (0 = full reset, 1 = keep all).
+    suspicionCarryForward = 0.3,
+
+    --- Disguise: suspicious behavior modifiers (weapon drawn, sprinting, crouching while disguised).
+    --- Guards within half detection range will accumulate suspicion at a reduced rate.
+    disguiseSuspicion = {
+        weaponDrawnMult = 3.0,    -- holding a weapon is very suspicious
+        sprintMult = 1.5,         -- sprinting in uniform attracts attention
+        crouchMult = 1.2,         -- crouching is mildly suspicious
+        rangeFraction = 0.5,      -- only guards within this fraction of detection range notice
+        buildRateFraction = 0.2,  -- base fraction of normal suspicion build rate
+    },
+}
+
+--- Player alert notifications: set enabled = false for pure visual immersion
+--- (no on-screen text when alert level changes). Players must rely on guard
+--- speech, behavior, and ambient audio cues.
+Config.AlertNotifications = {
+    enabled = false,
+}
+
+--- Guard respawn: dead post guards respawn after a cooldown when alert returns to patrol.
+--- Set delayMs high enough that heist players can finish before guards return.
+Config.GuardRespawn = {
+    enabled = true,
+    delayMs = 1800000, -- 30 minutes
 }
 
 -- ────────────────────────────────────────────────────────────────────────────
@@ -599,6 +638,13 @@ Config.GuardArchetypes = {
         routineScenarios = { 'WORLD_HUMAN_STAND_MOBILE', 'WORLD_HUMAN_DRINKING', 'WORLD_HUMAN_SMOKING' },
         speechPatrol = 'CHAT_STATE', speechSuspicious = 'GENERIC_HUMP',
         speechAlert = 'GENERIC_INSULT_MED', speechCombat = 'GENERIC_CURSE_MED',
+        tactics = {
+            useCover = false,
+            flanking = false,
+            retreatThreshold = 0.4,
+            suppressiveFire = false,
+            pursueOnExit = false,
+        },
     },
     {
         id = 'private_security',
@@ -613,6 +659,13 @@ Config.GuardArchetypes = {
         routineScenarios = { 'WORLD_HUMAN_GUARD_STAND', 'WORLD_HUMAN_SMOKING' },
         speechPatrol = 'CHAT_STATE', speechSuspicious = 'GENERIC_INSULT_MED',
         speechAlert = 'GENERIC_INSULT_HIGH', speechCombat = 'GENERIC_CURSE_HIGH',
+        tactics = {
+            useCover = true,
+            flanking = false,
+            retreatThreshold = nil,
+            suppressiveFire = true,
+            pursueOnExit = false,
+        },
     },
     {
         id = 'pmc',
@@ -627,6 +680,13 @@ Config.GuardArchetypes = {
         routineScenarios = { 'WORLD_HUMAN_GUARD_STAND_ARMY' },
         speechPatrol = 'CHAT_STATE', speechSuspicious = 'GENERIC_INSULT_MED',
         speechAlert = 'GENERIC_INSULT_HIGH', speechCombat = 'GENERIC_WAR_CRY',
+        tactics = {
+            useCover = true,
+            flanking = true,
+            retreatThreshold = nil,
+            suppressiveFire = true,
+            pursueOnExit = false,
+        },
     },
     {
         id = 'elite',
@@ -641,6 +701,14 @@ Config.GuardArchetypes = {
         routineScenarios = {},
         speechPatrol = 'CHAT_STATE', speechSuspicious = 'GENERIC_INSULT_HIGH',
         speechAlert = 'GENERIC_CURSE_HIGH', speechCombat = 'GENERIC_WAR_CRY',
+        tactics = {
+            useCover = true,
+            flanking = true,
+            retreatThreshold = nil,
+            suppressiveFire = true,
+            pursueOnExit = true,
+            pursueLosTimeout = 20000,
+        },
     },
 }
 
@@ -704,40 +772,104 @@ Config.SecurityZones = {
         },
 
         reinforcements = {
-            enabled = true, maxWaves = 2,
+            enabled = true, maxWaves = 3,
             waves = {
                 { delayMs = 15000, count = 3, archetypeId = 'private_security', spawnRadius = 40.0 },
                 { delayMs = 45000, count = 2, archetypeId = 'pmc', spawnRadius = 50.0 },
+                { delayMs = 80000, count = 2, archetypeId = 'pmc', spawnRadius = 55.0 },
             },
+            continuous = false,
         },
 
         objectives = {
             {
-                id = 'warehouse_safe', label = 'Crack Safe', icon = 'fas fa-vault',
-                type = 'safe', coords = vec4(1068.0, -3186.0, 5.9, 90.0),
-                prop = `prop_ld_int_safe_01`,
-                requiredItem = 'lockpick', consumeRequired = true,
-                maxAlertLevel = 'suspicious', interactDurationMs = 12000,
-                animDict = 'anim@heists@ornate_bank@grab_cash_heist', animName = 'grab_cash_a',
-                cooldownMs = 1800000,
-                lootTable = {
-                    { item = 'cash_roll', min = 2, max = 5, chance = 1.0 },
-                    { item = 'gold_chain', min = 0, max = 2, chance = 0.3 },
-                    { item = 'rolex', min = 0, max = 1, chance = 0.1 },
+                id = 'warehouse_camera',
+                label = 'Security Camera',
+                coords = vec4(1063.0, -3180.0, 6.9, 180.0),
+                prop = `prop_cctv_cam_01a`,
+                steps = {
+                    {
+                        id = 'disable_camera',
+                        label = 'Disable Camera',
+                        icon = 'fas fa-video-slash',
+                        equipmentTier = 'camera',
+                        maxAlertLevel = 'alert',
+                        interactDurationMs = 5000,
+                        animDict = 'anim@heists@prison_heiststation@cop_reactions',
+                        animName = 'yournotsupposedtobehere',
+                        noiseRadius = 0,
+                        onSuccess = { escalation = nil, zoneEffect = { detectionMultiplier = 0.7 } },
+                        onFail = { escalation = 'suspicious' },
+                    },
                 },
             },
             {
-                id = 'warehouse_laptop', label = 'Hack Laptop', icon = 'fas fa-laptop',
-                type = 'computer', coords = vec4(1070.0, -3182.0, 6.9, 270.0),
-                prop = `prop_laptop_01a`,
-                requiredItem = 'usb_hack', consumeRequired = true,
-                maxAlertLevel = 'alert', interactDurationMs = 8000,
-                animDict = 'anim@heists@prison_heiststation@cop_reactions', animName = 'yournotsupposedtobehere',
-                cooldownMs = 2400000,
-                lootTable = {
-                    { item = 'crypto_key', min = 1, max = 3, chance = 0.8 },
-                    { item = 'bank_schema', min = 0, max = 1, chance = 0.2 },
+                id = 'warehouse_safe',
+                label = 'Warehouse Safe',
+                coords = vec4(1068.0, -3186.0, 5.9, 90.0),
+                prop = `prop_ld_int_safe_01`,
+                cooldownMs = 1800000,
+                steps = {
+                    {
+                        id = 'crack_safe',
+                        label = 'Crack Safe',
+                        icon = 'fas fa-vault',
+                        equipmentTier = 'lockpick',
+                        maxAlertLevel = 'suspicious',
+                        interactDurationMs = 12000,
+                        animDict = 'anim@heists@ornate_bank@grab_cash_heist',
+                        animName = 'grab_cash_a',
+                        noiseRadius = 15.0,
+                        onSuccess = { escalation = nil },
+                        onFail = { escalation = 'suspicious' },
+                        lootTable = {
+                            { item = 'cash_roll', min = 2, max = 5, chance = 1.0 },
+                            { item = 'gold_chain', min = 0, max = 2, chance = 0.3 },
+                            { item = 'rolex', min = 0, max = 1, chance = 0.1 },
+                        },
+                    },
                 },
+            },
+            {
+                id = 'warehouse_laptop',
+                label = 'Security Laptop',
+                coords = vec4(1070.0, -3182.0, 6.9, 270.0),
+                prop = `prop_laptop_01a`,
+                cooldownMs = 2400000,
+                steps = {
+                    {
+                        id = 'hack_laptop',
+                        label = 'Hack Laptop',
+                        icon = 'fas fa-laptop-code',
+                        equipmentTier = 'hacking',
+                        maxAlertLevel = 'alert',
+                        interactDurationMs = 8000,
+                        animDict = 'anim@heists@prison_heiststation@cop_reactions',
+                        animName = 'yournotsupposedtobehere',
+                        noiseRadius = 5.0,
+                        onSuccess = { escalation = nil },
+                        onFail = { escalation = 'alert' },
+                        lootTable = {
+                            { item = 'crypto_key', min = 1, max = 3, chance = 0.8 },
+                            { item = 'bank_schema', min = 0, max = 1, chance = 0.2 },
+                        },
+                    },
+                },
+            },
+        },
+
+        shifts = {
+            {
+                startHour = 6, endHour = 18,
+                defaultArchetype = 'rent_a_cop',
+                postMultiplier = 1.2,
+                patrolMultiplier = 1.0,
+            },
+            {
+                startHour = 18, endHour = 6,
+                defaultArchetype = 'private_security',
+                postMultiplier = 0.8,
+                patrolMultiplier = 0.6,
             },
         },
     },
@@ -784,63 +916,333 @@ Config.SecurityZones = {
         },
 
         reinforcements = {
-            enabled = true, maxWaves = 3,
+            enabled = true, maxWaves = 8,
             waves = {
                 { delayMs = 8000, count = 4, archetypeId = 'pmc', spawnRadius = 35.0 },
                 { delayMs = 25000, count = 3, archetypeId = 'elite', spawnRadius = 40.0 },
                 { delayMs = 50000, count = 2, archetypeId = 'elite', spawnRadius = 45.0 },
             },
+            --- Continuous reinforcements: after initial waves, keep spawning until player leaves
+            continuous = true,
+            continuousIntervalMs = 25000,
+            continuousArchetype = 'pmc',
+            continuousCount = 3,
+            continuousSpawnRadius = 50.0,
         },
 
         objectives = {
             {
-                id = 'military_intel', label = 'Download Intel', icon = 'fas fa-satellite-dish',
-                type = 'computer', coords = vec4(-2355.0, 3247.0, 33.8, 180.0),
-                requiredItem = 'military_usb', consumeRequired = true,
-                maxAlertLevel = 'suspicious', interactDurationMs = 15000,
-                animDict = 'mp_arresting', animName = 'a_uncuff',
-                cooldownMs = 3600000,
-                lootTable = {
-                    { item = 'military_intel', min = 1, max = 1, chance = 1.0 },
-                    { item = 'weapon_blueprint', min = 0, max = 1, chance = 0.15 },
+                id = 'military_comms',
+                label = 'Communications Array',
+                coords = vec4(-2360.0, 3252.0, 33.8, 90.0),
+                prop = `prop_cs_satellite_dish`,
+                steps = {
+                    {
+                        id = 'jam_comms',
+                        label = 'Jam Communications',
+                        icon = 'fas fa-satellite-dish',
+                        equipmentTier = 'camera',
+                        maxAlertLevel = 'alert',
+                        interactDurationMs = 6000,
+                        animDict = 'anim@heists@prison_heiststation@cop_reactions',
+                        animName = 'yournotsupposedtobehere',
+                        noiseRadius = 0,
+                        onSuccess = { escalation = nil, zoneEffect = { reinforcementDelay = 15000 } },
+                        onFail = { escalation = 'alert' },
+                    },
                 },
+            },
+            {
+                id = 'military_terminal',
+                label = 'Intel Terminal',
+                coords = vec4(-2355.0, 3247.0, 33.8, 180.0),
+                cooldownMs = 3600000,
+                steps = {
+                    {
+                        id = 'download_intel',
+                        label = 'Download Intel',
+                        icon = 'fas fa-download',
+                        equipmentTier = 'hacking',
+                        maxAlertLevel = 'suspicious',
+                        interactDurationMs = 15000,
+                        animDict = 'mp_arresting',
+                        animName = 'a_uncuff',
+                        noiseRadius = 0,
+                        onSuccess = { escalation = nil },
+                        onFail = { escalation = 'suspicious' },
+                        lootTable = {
+                            { item = 'military_intel', min = 1, max = 1, chance = 1.0 },
+                            { item = 'weapon_blueprint', min = 0, max = 1, chance = 0.15 },
+                        },
+                    },
+                },
+            },
+        },
+
+        shifts = {
+            {
+                startHour = 6, endHour = 22,
+                defaultArchetype = 'pmc',
+                postMultiplier = 1.0,
+                patrolMultiplier = 1.0,
+            },
+            {
+                startHour = 22, endHour = 6,
+                defaultArchetype = 'elite',
+                postMultiplier = 0.7,
+                patrolMultiplier = 0.5,
             },
         },
     },
 }
 
 -- ============================================================================
--- BODYGUARD / ESCORT SETTINGS
+-- VEHICLE BUYER ARCHETYPES
+-- High risk / high reward buyers that approach in vehicles.
 -- ============================================================================
 
----@class BodyguardConfig
----@field maxBodyguards integer -- max active bodyguards per player
+---@class VehicleBuyerArchetype
+---@field id string
+---@field label string
 ---@field pedModels integer[]
----@field defaultWeapon integer
----@field followDistance number -- ideal follow distance
----@field combatRange number -- engage enemies within this range
----@field health integer -- ped max health
----@field armor integer -- ped armor value
----@field combatAbility integer -- 0 = poor, 1 = average, 2 = professional
----@field combatAttributes table<integer, boolean>
+---@field vehicles integer[] -- vehicle model hashes
+---@field baseWeight number
+---@field minReputation number
+---@field occupants integer[] -- {min, max} peds in the vehicle
+---@field quantityRange integer[] -- {min, max} items per deal
+---@field priceMultiplier number
+---@field patienceMs integer -- how long driver waits after parking
+---@field behavior string -- 'buy'|'robbery'|'supplier'|'undercover'
 
-Config.Bodyguard = {
-    maxBodyguards = 2,
-    pedModels = Config.PedModels.bodyguards,
-    defaultWeapon = `WEAPON_PISTOL`,
-    followDistance = 3.0,
-    combatRange = 30.0,
-    health = 300,
-    armor = 100,
-    combatAbility = 2,
-    combatAttributes = {
-        [0] = true,   -- CanUseCover
-        [1] = true,   -- CanUseVehicles
-        [2] = true,   -- CanDoDrivebys
-        [3] = true,   -- CanLeaveVehicle
-        [5] = true,   -- AlwaysFight
-        [46] = true,  -- CanFightArmedPedsWhenNotArmed
+Config.VehicleBuyerArchetypes = {
+    {
+        id = 'vehicle_bigbuyer',
+        label = 'Big Buyer',
+        pedModels = {
+            `g_m_y_mexgang_01`,
+            `g_m_y_famfor_01`,
+            `g_m_m_armboss_01`,
+            `a_m_y_business_03`,
+        },
+        vehicles = {
+            `schafter2`,
+            `oracle2`,
+            `fugitive`,
+            `tailgater`,
+            `emperor2`,
+        },
+        baseWeight = 30,
+        minReputation = 40,
+        occupants = { 1, 2 },
+        quantityRange = { 8, 15 },
+        priceMultiplier = 1.4,
+        patienceMs = 35000,
+        haggleChance = 0.5,
+        walkAwayThreshold = 0.30,
+        behavior = 'buy',
     },
+    {
+        id = 'vehicle_undercover',
+        label = 'Undercover',
+        pedModels = {
+            `s_m_y_cop_01`,
+            `a_m_y_business_01`,
+            `a_m_m_bevhills_02`,
+        },
+        vehicles = {
+            `washington`,
+            `stanier`,
+            `fugitive`,
+            `buffalo`,
+        },
+        baseWeight = 15,
+        minReputation = 0,
+        occupants = { 1, 2 },
+        quantityRange = { 1, 1 },
+        priceMultiplier = 1.0,
+        patienceMs = 40000,
+        haggleChance = 0.1,
+        walkAwayThreshold = 0.50,
+        behavior = 'undercover',
+        --- Dispatch notification interval (ms)
+        dispatchIntervalMs = 20000,
+    },
+    {
+        id = 'vehicle_robbery',
+        label = 'Robbery',
+        pedModels = {
+            `g_m_y_ballasout_01`,
+            `g_m_y_pologoon_01`,
+            `g_m_y_pologoon_02`,
+            `g_m_y_salvagoon_01`,
+        },
+        vehicles = {
+            `buccaneer`,
+            `manana`,
+            `emperor`,
+            `tornado`,
+            `primo`,
+        },
+        baseWeight = 15,
+        minReputation = 15,
+        occupants = { 2, 3 },
+        quantityRange = { 0, 0 },
+        priceMultiplier = 0.0,
+        patienceMs = 15000,
+        behavior = 'robbery',
+        --- Weapons given to occupants during robbery
+        weapons = { `WEAPON_PISTOL`, `WEAPON_MICROSMG` },
+    },
+    {
+        id = 'vehicle_supplier',
+        label = 'Supplier',
+        pedModels = {
+            `g_m_m_mexboss_01`,
+            `g_m_m_mexboss_02`,
+            `a_m_y_business_02`,
+            `g_m_m_chicold_01`,
+        },
+        vehicles = {
+            `dubsta`,
+            `baller`,
+            `cavalcade`,
+            `granger`,
+        },
+        baseWeight = 10,
+        minReputation = 60,
+        occupants = { 1, 2 },
+        quantityRange = { 10, 25 },
+        priceMultiplier = 0.7,
+        patienceMs = 30000,
+        behavior = 'supplier',
+    },
+}
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- PER-ZONE VEHICLE BUYER SETTINGS
+-- Added as a field to each DrugZone config above.
+-- ────────────────────────────────────────────────────────────────────────────
+
+Config.VehicleBuyerDefaults = {
+    maxVehicles = 1,             -- max simultaneous vehicle buyers per zone
+    cooldownMs = 45000,          -- min time between vehicle spawns
+    spawnDistance = 80.0,        -- how far away vehicles spawn (road node search)
+    parkDistance = 15.0,         -- how close to zone center they park
+    enabled = true,
+}
+
+-- ============================================================================
+-- FREE-GANGS INTEGRATION
+-- Awards gang reputation when players complete drug sales or security loot.
+-- Requires the 'free-gangs' resource to be running; gracefully no-ops if absent.
+-- ============================================================================
+
+Config.GangIntegration = {
+    enabled = true, -- master toggle; set false to disable all free-gangs hooks
+
+    --- Rep awarded on a successful foot-buyer drug sale
+    drugSale = {
+        masterRep = 2,            -- gang-wide reputation per sale
+        individualRep = 1,        -- player-specific reputation per sale
+        bulkBonusPerUnit = 0.5,   -- extra masterRep per unit above 1
+        zoneLoyalty = 0.3,        -- free-gangs territory influence per sale
+    },
+
+    --- Rep awarded on a successful vehicle-buyer drug sale
+    vehicleSale = {
+        masterRep = 5,            -- higher reward for riskier vehicle deals
+        individualRep = 3,
+        bulkBonusPerUnit = 0.3,
+        zoneLoyalty = 0.5,
+    },
+
+    --- Rep awarded when purchasing wholesale from a supplier vehicle
+    supplierPurchase = {
+        masterRep = 1,
+        individualRep = 1,
+        zoneLoyalty = 0.1,
+    },
+
+    --- Rep awarded when completing a security-zone objective (heist loot)
+    securityLoot = {
+        masterRep = 4,
+        individualRep = 3,
+        zoneLoyalty = 0.0,        -- security zones don't map to gang territories
+    },
+
+    --- Map pedscenarios drug zone IDs → free-gangs territory zone names.
+    --- If a mapping exists, zone loyalty is also awarded via AddZoneLoyalty.
+    --- Leave empty or comment out entries if your territories don't overlap.
+    zoneMapping = {
+        -- grove_street = 'grove_territory',
+        -- strawberry_ave = 'strawberry_territory',
+    },
+}
+
+-- ============================================================================
+-- EQUIPMENT TIERS
+-- Different tools that can accomplish the same task with varying efficiency.
+-- Steps reference a tier by key; the system picks the best available tool.
+-- Higher-tier tools reduce duration, change noise, and have different consume rates.
+-- ============================================================================
+
+Config.EquipmentTiers = {
+    lockpick = {
+        { item = 'lockpick', label = 'Basic Lockpick', durationMult = 1.0, consumeChance = 0.5 },
+        { item = 'advanced_lockpick', label = 'Advanced Lockpick', durationMult = 0.5, consumeChance = 0.2 },
+        { item = 'thermite', label = 'Thermite Charge', durationMult = 0.15, consumeChance = 1.0, noiseRadiusOverride = 30.0 },
+    },
+    hacking = {
+        { item = 'usb_hack', label = 'USB Drive', durationMult = 1.0, consumeChance = 0.8 },
+        { item = 'laptop_hack', label = 'Hacking Laptop', durationMult = 0.5, consumeChance = 0.0 },
+    },
+    camera = {
+        { item = 'signal_jammer', label = 'Signal Jammer', durationMult = 1.0, consumeChance = 0.0 },
+    },
+}
+
+-- ============================================================================
+-- GUARD MORALE SYSTEM
+-- Tracks per-guard courage. Low morale causes rent-a-cops to flee and
+-- lesser guards to retreat to defensive positions. Elite/PMC are immune.
+-- ============================================================================
+
+Config.GuardMorale = {
+    enabled = true,
+    base = 100,
+    deadColleaguePenalty = 30,
+    gunshotPenalty = 15,
+    woundedPenalty = 20,
+    playerHitBoost = 10,
+    fleeThreshold = 30,
+    retreatThreshold = 50,
+    immuneArchetypes = { 'elite', 'pmc' },
+}
+
+-- ============================================================================
+-- GUARD SHIFT SYSTEM
+-- Per-zone shift schedules that change guard composition by time of day.
+-- Configured per-zone in the SecurityZones table via the 'shifts' field.
+-- ============================================================================
+
+Config.GuardShifts = {
+    enabled = true,
+}
+
+-- ============================================================================
+-- DEBUG VISUALIZATION
+-- When Config.Debug is true, draws detection cones, suspicion bars,
+-- patrol waypoints, morale indicators, and zone boundaries.
+-- ============================================================================
+
+Config.DebugVisualization = {
+    drawDetectionCones = true,
+    drawSuspicionBars = true,
+    drawPatrolWaypoints = true,
+    drawMoraleIndicators = true,
+    drawObjectiveStates = true,
+    coneLength = 10.0,
+    coneAlpha = 80,
 }
 
 return Config

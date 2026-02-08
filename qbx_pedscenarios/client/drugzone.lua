@@ -52,6 +52,16 @@ local function getArchetype(id)
     return nil
 end
 
+---@param id string
+---@return VehicleBuyerArchetype?
+local function getVehicleArchetype(id)
+    if not Config.VehicleBuyerArchetypes then return nil end
+    for _, a in ipairs(Config.VehicleBuyerArchetypes) do
+        if a.id == id then return a end
+    end
+    return nil
+end
+
 -- ============================================================================
 -- SMART SPAWN POSITIONING
 -- ============================================================================
@@ -251,125 +261,137 @@ end
 local function runNegotiation(ped, data)
     if inNegotiation then return nil end
     inNegotiation = true
-    data.state = PedState.NEGOTIATING
 
-    local archetype = getArchetype(data.archetypeId)
-    if not archetype then inNegotiation = false return nil end
+    -- Use pcall so inNegotiation is ALWAYS reset, even if a callback errors
+    local ok, result = pcall(function()
+        data.state = PedState.NEGOTIATING
 
-    local offer = lib.callback.await('qbx_pedscenarios:server:startNegotiation', false,
-        data.zoneId, data.archetypeId, data.requestedItem, data.quantity)
+        local archetype = getArchetype(data.archetypeId) or getVehicleArchetype(data.archetypeId)
+        if not archetype then return nil end
 
-    if not offer or offer.error then
-        inNegotiation = false
-        if offer and offer.error == 'missing_items' then
-            lib.notify({
-                title = 'Drug Deal',
-                description = ("You don't have enough. Need %d, you have %d."):format(data.quantity, offer.hasCount),
-                type = 'error',
-            })
+        local offer = lib.callback.await('qbx_pedscenarios:server:startNegotiation', false,
+            data.zoneId, data.archetypeId, data.requestedItem, data.quantity)
+
+        if not offer or offer.error then
+            if offer and offer.error == 'missing_items' then
+                lib.notify({
+                    title = 'Drug Deal',
+                    description = ("You don't have enough. Need %d, you have %d."):format(data.quantity, offer.hasCount),
+                    type = 'error',
+                })
+            end
+            return nil
         end
+
+        local currentOffer = offer.buyerOffer
+        local round = offer.round
+        local maxRounds = offer.maxRounds
+        local accepted = nil
+
+        while not accepted do
+            local headerText = ('**%s** wants %dx %s'):format(
+                archetype.label, offer.quantity, offer.itemLabel)
+
+            local options = {
+                {
+                    title = ('Accept $%s'):format(lib.math.groupdigits(currentOffer)),
+                    description = 'Take the offer',
+                    icon = 'check',
+                    onSelect = function()
+                        accepted = currentOffer
+                    end,
+                },
+            }
+
+            if round <= maxRounds then
+                options[#options + 1] = {
+                    title = 'Counter-offer',
+                    description = ('Round %d/%d — name your price'):format(round, maxRounds),
+                    icon = 'hand-holding-dollar',
+                    onSelect = function()
+                        local input = lib.inputDialog('Counter Offer', {
+                            {
+                                type = 'number',
+                                label = ('Your price (fair ≈ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
+                                default = offer.fairPrice,
+                                min = 1,
+                                max = math.floor(offer.fairPrice * 2),
+                            },
+                        })
+
+                        if not input then accepted = -1 return end
+
+                        local result = lib.callback.await('qbx_pedscenarios:server:counterOffer', false, math.floor(input[1]))
+
+                        if not result or result.error then accepted = -1 return end
+
+                        if result.result == 'accepted' then
+                            accepted = result.finalPrice
+                        elseif result.result == 'counter' then
+                            currentOffer = result.buyerOffer
+                            round = result.round
+                            lib.notify({
+                                title = 'Negotiation',
+                                description = ('They counter with $%s'):format(lib.math.groupdigits(result.buyerOffer)),
+                                type = 'inform', duration = 3000,
+                            })
+                        elseif result.result == 'final_offer' then
+                            currentOffer = result.finalPrice
+                            round = maxRounds + 1
+                            lib.notify({
+                                title = 'Negotiation',
+                                description = ('Final offer: $%s — take it or leave it.'):format(lib.math.groupdigits(result.finalPrice)),
+                                type = 'warning', duration = 4000,
+                            })
+                        elseif result.result == 'walked_away' then
+                            lib.notify({
+                                title = 'Drug Deal',
+                                description = 'They walked away. You pushed too hard.',
+                                type = 'error',
+                            })
+                            playSpeech(ped, archetype.speechAngry)
+                            accepted = -1
+                        end
+                    end,
+                }
+            end
+
+            options[#options + 1] = {
+                title = 'Refuse',
+                description = 'Turn them away',
+                icon = 'xmark',
+                onSelect = function()
+                    lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
+                    playSpeech(ped, archetype.speechAngry)
+                    accepted = -1
+                end,
+            }
+
+            lib.registerContext({ id = 'drug_negotiation', title = headerText, options = options })
+            lib.showContext('drug_negotiation')
+
+            while not accepted and lib.getOpenContextMenu() == 'drug_negotiation' do
+                Wait(100)
+            end
+
+            if not accepted then
+                lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
+                accepted = -1
+            end
+        end
+
+        return accepted ~= -1 and accepted or nil
+    end)
+
+    inNegotiation = false
+
+    if not ok then
+        lib.print.error(('Negotiation error: %s'):format(tostring(result)))
+        pcall(lib.callback.await, 'qbx_pedscenarios:server:refuseSale', false)
         return nil
     end
 
-    local currentOffer = offer.buyerOffer
-    local round = offer.round
-    local maxRounds = offer.maxRounds
-    local accepted = nil
-
-    while not accepted do
-        local headerText = ('**%s** wants %dx %s'):format(
-            archetype.label, offer.quantity, offer.itemLabel)
-
-        local options = {
-            {
-                title = ('Accept $%s'):format(lib.math.groupdigits(currentOffer)),
-                description = 'Take the offer',
-                icon = 'check',
-                onSelect = function()
-                    accepted = currentOffer
-                end,
-            },
-        }
-
-        if round <= maxRounds then
-            options[#options + 1] = {
-                title = 'Counter-offer',
-                description = ('Round %d/%d — name your price'):format(round, maxRounds),
-                icon = 'hand-holding-dollar',
-                onSelect = function()
-                    local input = lib.inputDialog('Counter Offer', {
-                        {
-                            type = 'number',
-                            label = ('Your price (fair ≈ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
-                            default = offer.fairPrice,
-                            min = 1,
-                            max = math.floor(offer.fairPrice * 2),
-                        },
-                    })
-
-                    if not input then accepted = -1 return end
-
-                    local result = lib.callback.await('qbx_pedscenarios:server:counterOffer', false, math.floor(input[1]))
-
-                    if not result or result.error then accepted = -1 return end
-
-                    if result.result == 'accepted' then
-                        accepted = result.finalPrice
-                    elseif result.result == 'counter' then
-                        currentOffer = result.buyerOffer
-                        round = result.round
-                        lib.notify({
-                            title = 'Negotiation',
-                            description = ('They counter with $%s'):format(lib.math.groupdigits(result.buyerOffer)),
-                            type = 'inform', duration = 3000,
-                        })
-                    elseif result.result == 'final_offer' then
-                        currentOffer = result.finalPrice
-                        round = maxRounds + 1
-                        lib.notify({
-                            title = 'Negotiation',
-                            description = ('Final offer: $%s — take it or leave it.'):format(lib.math.groupdigits(result.finalPrice)),
-                            type = 'warning', duration = 4000,
-                        })
-                    elseif result.result == 'walked_away' then
-                        lib.notify({
-                            title = 'Drug Deal',
-                            description = 'They walked away. You pushed too hard.',
-                            type = 'error',
-                        })
-                        playSpeech(ped, archetype.speechAngry)
-                        accepted = -1
-                    end
-                end,
-            }
-        end
-
-        options[#options + 1] = {
-            title = 'Refuse',
-            description = 'Turn them away',
-            icon = 'xmark',
-            onSelect = function()
-                lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
-                playSpeech(ped, archetype.speechAngry)
-                accepted = -1
-            end,
-        }
-
-        lib.registerContext({ id = 'drug_negotiation', title = headerText, options = options })
-        lib.showContext('drug_negotiation')
-
-        while not accepted and lib.getOpenContextMenu() == 'drug_negotiation' do
-            Wait(100)
-        end
-
-        if not accepted then
-            lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
-            accepted = -1
-        end
-    end
-
-    inNegotiation = false
-    return accepted ~= -1 and accepted or nil
+    return result
 end
 
 -- ============================================================================
@@ -751,6 +773,22 @@ function InitDrugZones()
                         end
                     end
                 end)
+
+                -- Vehicle buyer spawn loop
+                local vbSettings = config.vehicleBuyer or Config.VehicleBuyerDefaults
+                if vbSettings.enabled then
+                    CreateThread(function()
+                        -- Initial delay before first vehicle
+                        Wait(math.random(15000, 30000))
+
+                        while zoneActive[zoneId] do
+                            if math.random() < getTimeOfDayMultiplier() * 0.5 then
+                                spawnVehicleBuyer(config)
+                            end
+                            Wait(vbSettings.cooldownMs)
+                        end
+                    end)
+                end
             end,
 
             onExit = function()
@@ -770,6 +808,7 @@ function InitDrugZones()
                                 buyerPeds[ped] = nil
                             end
                         end
+                        cleanupAllVehicleBuyers(zoneId)
                     end
                 end)
             end,
@@ -793,7 +832,695 @@ function CleanupDrugZones()
         RemoveScenarioPed(ped)
     end
     buyerPeds = {}
+
+    cleanupAllVehicleBuyers()
+    vehicleCooldowns = {}
+    vehicleToDriver = {}
     inNegotiation = false
+end
+
+-- ============================================================================
+-- VEHICLE BUYER SYSTEM
+-- High risk / high reward vehicle-based drug transactions
+-- ============================================================================
+
+local vehicleBuyers = {}   ---@type table<integer, VehicleBuyerData>
+local vehicleCooldowns = {} ---@type table<string, integer>  -- zoneId -> next spawn time
+
+---@class VehicleBuyerData
+---@field vehicle integer
+---@field driver integer
+---@field passengers integer[]
+---@field zoneId string
+---@field archetypeId string
+---@field requestedItem string
+---@field quantity integer
+---@field state string
+---@field spawnTime integer
+---@field patienceExpiry integer
+---@field dispatchThread boolean?
+
+local VehicleState = {
+    DRIVING_IN = 'driving_in',
+    PARKING = 'parking',
+    WAITING = 'waiting',
+    NEGOTIATING = 'negotiating',
+    ROBBERY = 'robbery',
+    LEAVING = 'leaving',
+}
+
+--- Reverse lookup: vehicle entity -> driver ped (for exports/interaction)
+local vehicleToDriver = {} ---@type table<integer, integer>
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- VEHICLE SPAWN HELPERS
+-- ────────────────────────────────────────────────────────────────────────────
+
+--- Find a road node at the requested distance from the zone center
+---@param zoneCoords vector3
+---@param spawnDistance number
+---@return vector3?, number? -- coords, heading
+local function findVehicleSpawnNode(zoneCoords, spawnDistance)
+    for _ = 1, 12 do
+        local angle = math.random() * 2 * math.pi
+        local x = zoneCoords.x + math.cos(angle) * spawnDistance
+        local y = zoneCoords.y + math.sin(angle) * spawnDistance
+
+        local found, nodePos, heading = GetClosestVehicleNodeWithHeading(x, y, zoneCoords.z, 1, 3.0, 0)
+        if found then
+            return vec3(nodePos.x, nodePos.y, nodePos.z), heading
+        end
+    end
+    return nil, nil
+end
+
+--- Find a road node near the zone center for parking
+---@param zoneCoords vector3
+---@param parkDistance number
+---@return vector3?, number?
+local function findParkingNode(zoneCoords, parkDistance)
+    for _ = 1, 10 do
+        local angle = math.random() * 2 * math.pi
+        local dist = parkDistance * (0.6 + math.random() * 0.4)
+        local x = zoneCoords.x + math.cos(angle) * dist
+        local y = zoneCoords.y + math.sin(angle) * dist
+
+        local found, nodePos, heading = GetClosestVehicleNodeWithHeading(x, y, zoneCoords.z, 1, 3.0, 0)
+        if found then
+            return vec3(nodePos.x, nodePos.y, nodePos.z), heading
+        end
+    end
+    return nil, nil
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- VEHICLE CLEANUP
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+local function cleanupVehicleBuyer(driverPed)
+    local data = vehicleBuyers[driverPed]
+    if not data then return end
+
+    data.dispatchThread = false
+
+    -- Clear reverse lookup
+    if data.vehicle then
+        vehicleToDriver[data.vehicle] = nil
+    end
+
+    -- Clean up passengers
+    if data.passengers then
+        for _, passPed in ipairs(data.passengers) do
+            if DoesEntityExist(passPed) then
+                RemoveScenarioPed(passPed)
+            end
+        end
+    end
+
+    -- Clean up driver
+    if DoesEntityExist(driverPed) then
+        RemoveScenarioPed(driverPed)
+    end
+
+    -- Clean up vehicle
+    if data.vehicle and DoesEntityExist(data.vehicle) then
+        SetEntityAsMissionEntity(data.vehicle, false, true)
+        DeleteVehicle(data.vehicle)
+    end
+
+    vehicleBuyers[driverPed] = nil
+end
+
+--- Drive away and cleanup (all occupants remain in vehicle)
+---@param driverPed integer
+local function vehicleDriveAwayAndCleanup(driverPed)
+    local data = vehicleBuyers[driverPed]
+    if not data then return end
+
+    data.state = VehicleState.LEAVING
+    data.dispatchThread = false
+
+    local vehicle = data.vehicle
+    if not DoesEntityExist(vehicle) or not DoesEntityExist(driverPed) then
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
+    -- Start engine and drive away
+    SetVehicleEngineOn(vehicle, true, true, false)
+    SetVehicleHandbrake(vehicle, false)
+    ClearPedTasks(driverPed)
+    SetBlockingOfNonTemporaryEvents(driverPed, true)
+    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 786603)
+
+    -- Delayed cleanup
+    SetTimeout(20000, function()
+        cleanupVehicleBuyer(driverPed)
+    end)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- UNDERCOVER DISPATCH LOOP
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+---@param zoneId string
+local function startUndercoverDispatch(driverPed, zoneId)
+    local data = vehicleBuyers[driverPed]
+    if not data then return end
+    data.dispatchThread = true
+
+    local archetype = getVehicleArchetype(data.archetypeId)
+    local intervalMs = (archetype and archetype.dispatchIntervalMs) or 20000
+
+    -- Immediate dispatch on spawn
+    TriggerServerEvent('qbx_pedscenarios:server:sendUndercoverDispatch', zoneId)
+
+    CreateThread(function()
+        while data.dispatchThread and DoesEntityExist(driverPed) do
+            Wait(intervalMs)
+            if not data.dispatchThread then return end
+            if not DoesEntityExist(driverPed) then return end
+            TriggerServerEvent('qbx_pedscenarios:server:sendUndercoverDispatch', zoneId)
+        end
+    end)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- ROBBERY BEHAVIOR (drive-by from vehicle)
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+local function handleRobberyBehavior(driverPed)
+    local data = vehicleBuyers[driverPed]
+    if not data then return end
+
+    data.state = VehicleState.ROBBERY
+    local archetype = getVehicleArchetype(data.archetypeId)
+    if not archetype then return end
+
+    local vehicle = data.vehicle
+    if not vehicle or not DoesEntityExist(vehicle) then
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
+    lib.notify({
+        title = 'Robbery!',
+        description = 'They\'re pulling weapons from the car!',
+        type = 'error', duration = 5000,
+    })
+
+    -- Arm passengers for drive-by (driver doesn't shoot, drives)
+    local weaponPool = archetype.weapons or { `WEAPON_PISTOL` }
+
+    -- Enable drive-by combat for all occupants
+    SetPedConfigFlag(driverPed, 35, true) -- CPED_CONFIG_FLAG_DrivebysAllowed
+
+    if data.passengers then
+        for _, passPed in ipairs(data.passengers) do
+            if DoesEntityExist(passPed) then
+                local weapon = PickRandom(weaponPool)
+                GivePedLoadout(passPed, weapon)
+                SetPedCombatAttributes(passPed, 3, true) -- CanLeaveVehicle = disabled below
+                SetPedConfigFlag(passPed, 35, true) -- DrivebysAllowed
+
+                -- Drive-by task: shoot from vehicle at player
+                local playerCoords = GetEntityCoords(cache.ped)
+                TaskDriveBy(passPed, cache.ped, 0,
+                    playerCoords.x, playerCoords.y, playerCoords.z,
+                    50.0, 100, true, `FIRING_PATTERN_BURST_FIRE_DRIVEBY`)
+                SetBlockingOfNonTemporaryEvents(passPed, true)
+            end
+        end
+    end
+
+    -- Server-side robbery processing (steal items, add heat)
+    lib.callback.await('qbx_pedscenarios:server:processVehicleRobbery', false, data.zoneId)
+
+    -- After a delay, they flee
+    SetTimeout(6000, function()
+        if not DoesEntityExist(driverPed) or not DoesEntityExist(vehicle) then
+            cleanupVehicleBuyer(driverPed)
+            return
+        end
+
+        -- Floor it out of there
+        SetVehicleEngineOn(vehicle, true, true, false)
+        SetVehicleHandbrake(vehicle, false)
+        ClearPedTasks(driverPed)
+        TaskVehicleDriveWander(driverPed, vehicle, 35.0, 786988) -- 786988 = rush + avoid traffic + ignore lights
+
+        -- Clear passenger drive-by tasks so they stop shooting
+        if data.passengers then
+            for _, passPed in ipairs(data.passengers) do
+                if DoesEntityExist(passPed) then
+                    ClearPedTasks(passPed)
+                end
+            end
+        end
+
+        SetTimeout(15000, function()
+            cleanupVehicleBuyer(driverPed)
+        end)
+    end)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- SUPPLIER BEHAVIOR (sells TO the player)
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+local function handleSupplierInteraction(driverPed)
+    local data = vehicleBuyers[driverPed]
+    if not data or data.state ~= VehicleState.WAITING then return end
+    if inNegotiation then return end
+
+    inNegotiation = true
+    data.state = VehicleState.NEGOTIATING
+
+    local inventory = lib.callback.await('qbx_pedscenarios:server:getSupplierInventory', false, data.zoneId)
+
+    if not inventory or not inventory.items or #inventory.items == 0 then
+        inNegotiation = false
+        lib.notify({
+            title = 'Supplier',
+            description = 'They have nothing to offer right now.',
+            type = 'inform',
+        })
+        vehicleDriveAwayAndCleanup(driverPed)
+        return
+    end
+
+    -- Build context menu of available items
+    local options = {}
+    for _, offer in ipairs(inventory.items) do
+        options[#options + 1] = {
+            title = ('%s x%d'):format(offer.label, offer.quantity),
+            description = ('$%s total ($%s each)'):format(
+                lib.math.groupdigits(offer.totalPrice),
+                lib.math.groupdigits(offer.pricePerUnit)
+            ),
+            icon = 'fas fa-box',
+            onSelect = function()
+                local result = lib.callback.await('qbx_pedscenarios:server:processSupplierSale', false,
+                    data.zoneId, offer.item, offer.quantity, offer.totalPrice)
+
+                if result and result.result == 'success' then
+                    lib.notify({
+                        title = 'Supplier',
+                        description = ('Purchased %dx %s for $%s'):format(
+                            offer.quantity, offer.label,
+                            lib.math.groupdigits(offer.totalPrice)
+                        ),
+                        type = 'success',
+                    })
+                elseif result and result.error == 'no_cash' then
+                    lib.notify({
+                        title = 'Supplier',
+                        description = ('Not enough cash. Need $%s'):format(lib.math.groupdigits(offer.totalPrice)),
+                        type = 'error',
+                    })
+                else
+                    lib.notify({
+                        title = 'Supplier',
+                        description = 'Transaction failed.',
+                        type = 'error',
+                    })
+                end
+            end,
+        }
+    end
+
+    options[#options + 1] = {
+        title = 'No thanks',
+        description = 'Turn them away',
+        icon = 'xmark',
+        onSelect = function() end,
+    }
+
+    lib.registerContext({
+        id = 'vehicle_supplier_menu',
+        title = 'Wholesale Supplier',
+        options = options,
+    })
+    lib.showContext('vehicle_supplier_menu')
+
+    while lib.getOpenContextMenu() == 'vehicle_supplier_menu' do
+        Wait(100)
+    end
+
+    inNegotiation = false
+
+    -- Sale animation
+    if DoesEntityExist(driverPed) then
+        local animCompleted = playSaleAnimation(driverPed)
+        if not animCompleted then
+            lib.notify({ title = 'Supplier', description = 'Exchange cancelled.', type = 'error' })
+        end
+    end
+
+    vehicleDriveAwayAndCleanup(driverPed)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- VEHICLE BUYER INTERACTION (player approaches the vehicle)
+-- All occupants remain in the vehicle for the entire transaction.
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+local function onInteractWithVehicleBuyer(driverPed)
+    local data = vehicleBuyers[driverPed]
+    if not data or data.state ~= VehicleState.WAITING then return end
+
+    local archetype = getVehicleArchetype(data.archetypeId)
+    if not archetype then return end
+
+    if archetype.behavior == 'supplier' then
+        handleSupplierInteraction(driverPed)
+        return
+    end
+
+    if archetype.behavior == 'robbery' then
+        handleRobberyBehavior(driverPed)
+        return
+    end
+
+    -- Normal buy behavior (big buyer / undercover)
+    -- Player approaches the vehicle window — driver stays seated
+    if inNegotiation then return end
+
+    local acceptedPrice
+    if Config.Negotiation.enabled then
+        acceptedPrice = runNegotiation(driverPed, {
+            ped = driverPed,
+            groupPeds = {},
+            zoneId = data.zoneId,
+            archetypeId = data.archetypeId,
+            requestedItem = data.requestedItem,
+            quantity = data.quantity,
+            state = PedState.NEGOTIATING,
+            spawnTime = data.spawnTime,
+            patienceExpiry = data.patienceExpiry,
+        })
+    else
+        local offer = lib.callback.await('qbx_pedscenarios:server:startNegotiation', false,
+            data.zoneId, data.archetypeId, data.requestedItem, data.quantity)
+        if offer and not offer.error then acceptedPrice = offer.fairPrice end
+    end
+
+    if not acceptedPrice then
+        vehicleDriveAwayAndCleanup(driverPed)
+        return
+    end
+
+    -- Window exchange animation (player only)
+    local animCompleted = playSaleAnimation(driverPed)
+    if not animCompleted then
+        lib.callback.await('qbx_pedscenarios:server:refuseSale', false)
+        lib.notify({ title = 'Vehicle Deal', description = 'Exchange cancelled.', type = 'error' })
+        vehicleDriveAwayAndCleanup(driverPed)
+        return
+    end
+
+    local result = lib.callback.await('qbx_pedscenarios:server:completeSale', false, acceptedPrice, data.archetypeId)
+
+    if not result then
+        vehicleDriveAwayAndCleanup(driverPed)
+        return
+    end
+
+    if result.result == 'risk_event' then
+        if data.archetypeId == 'vehicle_undercover' then
+            lib.notify({
+                title = 'Undercover!',
+                description = 'It was a setup! They\'re cops!',
+                type = 'error', duration = 6000,
+            })
+            if result.event.wantedLevel then
+                Wait(500)
+                SetPlayerWantedLevel(cache.playerId, result.event.wantedLevel, false)
+                SetPlayerWantedLevelNow(cache.playerId, false)
+            end
+        else
+            handleRiskEvent(driverPed, result.event, {
+                ped = driverPed,
+                groupPeds = data.passengers or {},
+                zoneId = data.zoneId,
+                archetypeId = data.archetypeId,
+                requestedItem = data.requestedItem,
+                quantity = data.quantity,
+                state = PedState.RISK,
+                spawnTime = data.spawnTime,
+                patienceExpiry = data.patienceExpiry,
+            })
+        end
+        SetTimeout(5000, function()
+            vehicleDriveAwayAndCleanup(driverPed)
+        end)
+        return
+    end
+
+    if result.result == 'success' then
+        playSpeech(driverPed, 'GENERIC_THANKS')
+        lib.notify({
+            title = 'Vehicle Drug Sale',
+            description = ('Sold for $%s'):format(lib.math.groupdigits(result.payment)),
+            type = 'success',
+        })
+    end
+
+    vehicleDriveAwayAndCleanup(driverPed)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- VEHICLE BUYER STATE MACHINE
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param driverPed integer
+---@param zoneConfig DrugZoneConfig
+local function startVehicleBuyerBehavior(driverPed, zoneConfig)
+    local data = vehicleBuyers[driverPed]
+    if not data then return end
+
+    local archetype = getVehicleArchetype(data.archetypeId)
+    if not archetype then return end
+
+    local vbSettings = zoneConfig.vehicleBuyer or Config.VehicleBuyerDefaults
+    local vehicle = data.vehicle
+
+    -- Find parking spot near zone
+    local parkPos, parkHeading = findParkingNode(zoneConfig.zone.coords, vbSettings.parkDistance)
+    if not parkPos then
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
+    -- Phase 1: Drive to parking spot
+    data.state = VehicleState.DRIVING_IN
+    TaskVehicleDriveToCoordLongrange(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, 18.0, 786603, 5.0)
+
+    -- Wait for arrival
+    local arrivalTimeout = GetGameTimer() + 30000
+    while data.state == VehicleState.DRIVING_IN and DoesEntityExist(driverPed) and DoesEntityExist(vehicle) do
+        local vehPos = GetEntityCoords(vehicle)
+        if #(vehPos - parkPos) < 8.0 then
+            break
+        end
+        if GetGameTimer() > arrivalTimeout then
+            cleanupVehicleBuyer(driverPed)
+            return
+        end
+        Wait(500)
+    end
+
+    if not DoesEntityExist(driverPed) or not DoesEntityExist(vehicle) then
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
+    -- Phase 2: Park the vehicle
+    data.state = VehicleState.PARKING
+    ClearPedTasks(driverPed)
+    TaskVehiclePark(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, parkHeading or 0.0, 1, 10.0, false)
+    Wait(4000)
+
+    -- Stop the vehicle
+    if DoesEntityExist(vehicle) then
+        SetVehicleHandbrake(vehicle, true)
+        SetVehicleEngineOn(vehicle, false, false, true)
+    end
+
+    -- Start undercover dispatch if applicable
+    if archetype.behavior == 'undercover' then
+        startUndercoverDispatch(driverPed, data.zoneId)
+    end
+
+    -- Phase 3: Wait in vehicle for player to approach
+    data.state = VehicleState.WAITING
+    data.patienceExpiry = GetGameTimer() + archetype.patienceMs
+
+    -- Robbery vehicles wait a moment then open fire if player is close
+    if archetype.behavior == 'robbery' then
+        Wait(2000)
+        -- Check if player is within range, otherwise wait
+        local timeout = GetGameTimer() + archetype.patienceMs
+        while DoesEntityExist(driverPed) and DoesEntityExist(vehicle) do
+            local playerDist = #(GetEntityCoords(cache.ped) - GetEntityCoords(vehicle))
+            if playerDist < 8.0 then
+                handleRobberyBehavior(driverPed)
+                return
+            end
+            if GetGameTimer() > timeout then
+                vehicleDriveAwayAndCleanup(driverPed)
+                return
+            end
+            Wait(500)
+        end
+        cleanupVehicleBuyer(driverPed)
+        return
+    end
+
+    lib.notify({
+        title = 'Drug Zone',
+        description = 'A vehicle has pulled up... approach the window.',
+        type = 'inform', duration = 5000,
+    })
+
+    -- Wait for player interaction or patience to expire
+    while data.state == VehicleState.WAITING and DoesEntityExist(driverPed) do
+        if GetGameTimer() > data.patienceExpiry then
+            lib.notify({
+                title = 'Drug Zone',
+                description = 'The vehicle drove off — you took too long.',
+                type = 'inform',
+            })
+            vehicleDriveAwayAndCleanup(driverPed)
+            return
+        end
+        Wait(500)
+    end
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- SPAWN VEHICLE BUYER
+-- ────────────────────────────────────────────────────────────────────────────
+
+---@param zoneConfig DrugZoneConfig
+local function spawnVehicleBuyer(zoneConfig)
+    local vbSettings = zoneConfig.vehicleBuyer or Config.VehicleBuyerDefaults
+    if not vbSettings.enabled then return end
+
+    -- Check cooldown
+    if vehicleCooldowns[zoneConfig.id] and GetGameTimer() < vehicleCooldowns[zoneConfig.id] then
+        return
+    end
+
+    -- Check max vehicles
+    local activeCount = 0
+    for _, vData in pairs(vehicleBuyers) do
+        if vData.zoneId == zoneConfig.id and vData.state ~= VehicleState.LEAVING then
+            activeCount = activeCount + 1
+        end
+    end
+    if activeCount >= vbSettings.maxVehicles then return end
+
+    -- Ask server for archetype
+    local gameHour = GetClockHours()
+    local spawnData = lib.callback.await('qbx_pedscenarios:server:rollVehicleBuyerSpawn', false,
+        zoneConfig.id, gameHour)
+
+    if not spawnData then return end
+
+    local archetype = getVehicleArchetype(spawnData.archetypeId)
+    if not archetype then return end
+
+    -- Find road node for spawn
+    local spawnPos, spawnHeading = findVehicleSpawnNode(zoneConfig.zone.coords, vbSettings.spawnDistance)
+    if not spawnPos then return end
+
+    -- Spawn vehicle
+    local vehicleModel = PickRandom(archetype.vehicles)
+    if not RequestModelAsync(vehicleModel, 5000) then return end
+
+    local vehicle = CreateVehicle(vehicleModel, spawnPos.x, spawnPos.y, spawnPos.z, spawnHeading or 0.0, false, true)
+    if not DoesEntityExist(vehicle) then
+        SetModelAsNoLongerNeeded(vehicleModel)
+        return
+    end
+
+    SetEntityAsMissionEntity(vehicle, true, true)
+    SetVehicleEngineOn(vehicle, true, true, false)
+    SetVehicleDoorsLocked(vehicle, 0)
+    SetModelAsNoLongerNeeded(vehicleModel)
+
+    -- Spawn driver
+    local driverModel = PickRandom(archetype.pedModels)
+    local driver = SpawnScenarioPed(driverModel, spawnPos, spawnHeading or 0.0, 0)
+    if not driver then
+        SetEntityAsMissionEntity(vehicle, false, true)
+        DeleteVehicle(vehicle)
+        return
+    end
+
+    SetPedIntoVehicle(driver, vehicle, -1)
+    SetPedRelationshipGroupHash(driver, `DRUGBUYER_GROUP`)
+    SetBlockingOfNonTemporaryEvents(driver, true)
+
+    -- Spawn passengers
+    local passengers = {}
+    local numOccupants = math.random(archetype.occupants[1], archetype.occupants[2])
+    local maxPassengerSeats = GetVehicleMaxNumberOfPassengers(vehicle)
+
+    for i = 2, numOccupants do
+        local seatIndex = i - 2
+        if seatIndex >= maxPassengerSeats then break end
+
+        local passModel = PickRandom(archetype.pedModels)
+        local passPed = SpawnScenarioPed(passModel, spawnPos, spawnHeading or 0.0, 0)
+        if passPed then
+            SetPedIntoVehicle(passPed, vehicle, seatIndex)
+            SetPedRelationshipGroupHash(passPed, `DRUGBUYER_GROUP`)
+            SetBlockingOfNonTemporaryEvents(passPed, true)
+            passengers[#passengers + 1] = passPed
+        end
+    end
+
+    vehicleBuyers[driver] = {
+        vehicle = vehicle,
+        driver = driver,
+        passengers = passengers,
+        zoneId = zoneConfig.id,
+        archetypeId = spawnData.archetypeId,
+        requestedItem = spawnData.requestedItem,
+        quantity = spawnData.quantity,
+        state = VehicleState.DRIVING_IN,
+        spawnTime = GetGameTimer(),
+        patienceExpiry = 0,
+    }
+
+    -- Register reverse lookup (vehicle -> driver) for interaction
+    vehicleToDriver[vehicle] = driver
+
+    vehicleCooldowns[zoneConfig.id] = GetGameTimer() + vbSettings.cooldownMs
+
+    -- Start behavior in separate thread
+    CreateThread(function()
+        startVehicleBuyerBehavior(driver, zoneConfig)
+    end)
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- VEHICLE BUYER CLEANUP (called from zone exit and resource stop)
+-- ────────────────────────────────────────────────────────────────────────────
+
+local function cleanupAllVehicleBuyers(zoneId)
+    for driverPed, vData in pairs(vehicleBuyers) do
+        if not zoneId or vData.zoneId == zoneId then
+            cleanupVehicleBuyer(driverPed)
+        end
+    end
 end
 
 -- ============================================================================
@@ -812,4 +1539,23 @@ end)
 exports('IsDrugBuyer', function(pedEntity)
     local data = buyerPeds[pedEntity]
     return data ~= nil and data.state == PedState.WAITING
+end)
+
+--- Interact with a vehicle buyer. Accepts either a vehicle entity or driver ped.
+exports('InteractVehicleBuyer', function(entity)
+    -- Resolve to driver ped whether given vehicle or ped
+    local driverPed = vehicleToDriver[entity] or entity
+    local data = vehicleBuyers[driverPed]
+    if data and data.state == VehicleState.WAITING then
+        onInteractWithVehicleBuyer(driverPed)
+        return true
+    end
+    return false
+end)
+
+--- Check if entity is a vehicle buyer. Accepts either a vehicle entity or driver ped.
+exports('IsVehicleBuyer', function(entity)
+    local driverPed = vehicleToDriver[entity] or entity
+    local data = vehicleBuyers[driverPed]
+    return data ~= nil and data.state == VehicleState.WAITING
 end)

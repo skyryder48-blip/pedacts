@@ -30,42 +30,6 @@ end)
 -- COMMANDS (using ox_lib command registration)
 -- ============================================================================
 
--- Bodyguard commands
-lib.addKeybind({
-    name = 'spawn_bodyguard',
-    description = 'Spawn a bodyguard',
-    defaultKey = '',  -- No default key, player must bind
-    onPressed = function()
-        if not initialized then return end
-        SpawnBodyguard()
-    end,
-})
-
-RegisterCommand('bodyguard', function(_, args)
-    if not initialized then return end
-
-    local action = args[1]
-
-    if action == 'spawn' or action == 'hire' then
-        SpawnBodyguard()
-    elseif action == 'dismiss' or action == 'fire' then
-        DismissAllBodyguards()
-    elseif action == 'count' then
-        local count = GetBodyguardCount()
-        lib.notify({
-            title = 'Bodyguard',
-            description = ('Active bodyguards: %d / %d'):format(count, Config.Bodyguard.maxBodyguards),
-            type = 'inform',
-        })
-    else
-        lib.notify({
-            title = 'Bodyguard',
-            description = 'Usage: /bodyguard [spawn|dismiss|count]',
-            type = 'inform',
-        })
-    end
-end, false)
-
 -- Debug command
 RegisterCommand('pedscenarios_debug', function()
     Config.Debug = not Config.Debug
@@ -83,11 +47,58 @@ RegisterCommand('pedscenarios_debug', function()
 end, false)
 
 -- ============================================================================
+-- KEYBIND INTERACTION (alternative to ox_target)
+-- ============================================================================
+
+lib.addKeybind({
+    name = 'drug_deal_interact',
+    description = 'Interact with nearby drug buyer or vehicle',
+    defaultKey = 'E',
+    onPressed = function()
+        if not initialized then return end
+
+        local playerCoords = GetEntityCoords(cache.ped)
+        local closestEntity, closestDist, interactionType = nil, 4.0, nil
+
+        -- Check foot buyers (peds)
+        for _, ped in ipairs(GetGamePool('CPed')) do
+            if ped ~= cache.ped and DoesEntityExist(ped) then
+                local dist = #(playerCoords - GetEntityCoords(ped))
+                if dist < closestDist and exports.qbx_pedscenarios:IsDrugBuyer(ped) then
+                    closestEntity = ped
+                    closestDist = dist
+                    interactionType = 'foot'
+                end
+            end
+        end
+
+        -- Check vehicle buyers (vehicles)
+        for _, veh in ipairs(GetGamePool('CVehicle')) do
+            if DoesEntityExist(veh) then
+                local dist = #(playerCoords - GetEntityCoords(veh))
+                if dist < closestDist and exports.qbx_pedscenarios:IsVehicleBuyer(veh) then
+                    closestEntity = veh
+                    closestDist = dist
+                    interactionType = 'vehicle'
+                end
+            end
+        end
+
+        if closestEntity then
+            if interactionType == 'foot' then
+                exports.qbx_pedscenarios:InteractDrugBuyer(closestEntity)
+            elseif interactionType == 'vehicle' then
+                exports.qbx_pedscenarios:InteractVehicleBuyer(closestEntity)
+            end
+        end
+    end,
+})
+
+-- ============================================================================
 -- OX_TARGET INTEGRATION (optional - add interactions to scenario peds)
 -- ============================================================================
 
--- Drug buyer interaction target
--- This adds a targetable option to peds near drug zones
+-- Drug buyer interaction: foot buyers via addGlobalPed
 if GetResourceState('ox_target') == 'started' then
     exports.ox_target:addGlobalPed({
         {
@@ -103,37 +114,27 @@ if GetResourceState('ox_target') == 'started' then
             end,
         },
     })
+
+    -- Vehicle buyer interaction: target the vehicle, not the ped
+    exports.ox_target:addGlobalVehicle({
+        {
+            name = 'pedscenarios_vehicle_buyer_interact',
+            icon = 'fas fa-car',
+            label = 'Deal',
+            distance = 4.0,
+            canInteract = function(entity)
+                return exports.qbx_pedscenarios:IsVehicleBuyer(entity)
+            end,
+            onSelect = function(data)
+                exports.qbx_pedscenarios:InteractVehicleBuyer(data.entity)
+            end,
+        },
+    })
 end
 
 -- ============================================================================
 -- EVENT HANDLERS
 -- ============================================================================
-
--- Player death: dismiss bodyguards temporarily
-AddEventHandler('gameEventTriggered', function(event, data)
-    if event == 'CEventNetworkEntityDamage' then
-        local victim = data[1]
-        local isDead = data[4] == 1
-
-        if victim == cache.ped and isDead then
-            -- Don't remove, just stop follow loops; they'll resume when player respawns
-            for _, bgData in pairs(bodyguards or {}) do
-                bgData.followThread = false
-            end
-        end
-    end
-end)
-
--- Player respawn: restart bodyguard follow behavior
-RegisterNetEvent('qbx_pedscenarios:client:onPlayerRespawn', function()
-    for ped, data in pairs(bodyguards or {}) do
-        if DoesEntityExist(ped) then
-            startFollowBehavior(ped)
-        else
-            bodyguards[ped] = nil
-        end
-    end
-end)
 
 -- Full cleanup on resource stop (also handled in utils.lua for peds)
 AddEventHandler('onResourceStop', function(resource)
@@ -147,7 +148,6 @@ end)
 RegisterNetEvent('qbx_core:client:onLogout', function()
     CleanupDrugZones()
     CleanupSecurityZones()
-    CleanupBodyguards()
     initialized = false
 end)
 
