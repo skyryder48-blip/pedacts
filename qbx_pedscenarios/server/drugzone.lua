@@ -319,6 +319,12 @@ local function calculateFairPrice(itemName, archetypeId, quantity, playerSource,
     for _, a in ipairs(Config.BuyerArchetypes) do
         if a.id == archetypeId then archetype = a break end
     end
+    -- Also search vehicle buyer archetypes
+    if not archetype and Config.VehicleBuyerArchetypes then
+        for _, a in ipairs(Config.VehicleBuyerArchetypes) do
+            if a.id == archetypeId then archetype = a break end
+        end
+    end
     if not archetype then return 0, 0 end
 
     local variance = 1.0 + (math.random() * 2 - 1) * itemDef.priceVariance
@@ -648,6 +654,11 @@ lib.callback.register('qbx_pedscenarios:server:counterOffer', function(source, c
     for _, a in ipairs(Config.BuyerArchetypes) do
         if a.id == session.archetypeId then archetype = a break end
     end
+    if not archetype and Config.VehicleBuyerArchetypes then
+        for _, a in ipairs(Config.VehicleBuyerArchetypes) do
+            if a.id == session.archetypeId then archetype = a break end
+        end
+    end
     if not archetype then return { error = 'invalid' } end
 
     local greedRatio = (counterPrice - session.fairPrice) / session.fairPrice
@@ -683,7 +694,10 @@ lib.callback.register('qbx_pedscenarios:server:counterOffer', function(source, c
 end)
 
 --- Complete sale
-lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, acceptedPrice)
+--- @param source integer
+--- @param acceptedPrice integer
+--- @param archetypeId? string -- vehicle archetype id, used to force undercover risk
+lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, acceptedPrice, archetypeId)
     local session = negotiations[source]
     if not session then return { error = 'no_session' } end
 
@@ -694,6 +708,31 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
     if not hasCount or hasCount < session.quantity then
         negotiations[source] = nil
         return { error = 'missing_items' }
+    end
+
+    -- Undercover vehicle archetype ALWAYS triggers undercover risk
+    if archetypeId == 'vehicle_undercover' then
+        lib.print.warn(('UNDERCOVER VEHICLE bust for player %s in zone "%s"'):format(source, session.zoneId))
+
+        removeRep(source, session.zoneId, Config.Reputation.lossOnRiskEvent)
+        addHeat(session.zoneId, 8.0)
+
+        -- Still take their items
+        exports.ox_inventory:RemoveItem(source, session.itemName, session.quantity)
+
+        negotiations[source] = nil
+
+        return {
+            result = 'risk_event',
+            event = {
+                id = 'undercover',
+                label = 'Undercover Vehicle',
+                wantedLevel = 3,
+                pedAttacks = false,
+                stealItem = true,
+                pedModel = `s_m_y_cop_01`,
+            },
+        }
     end
 
     -- Roll risk event BEFORE processing
@@ -792,6 +831,225 @@ lib.callback.register('qbx_pedscenarios:server:getDrugStats', function(source, z
         totalSales = stats.totalSales,
         totalEarned = stats.totalEarned,
     }
+end)
+
+-- ============================================================================
+-- VEHICLE BUYER CALLBACKS
+-- ============================================================================
+
+--- Roll which vehicle buyer archetype to spawn
+lib.callback.register('qbx_pedscenarios:server:rollVehicleBuyerSpawn', function(source, zoneId, gameHour)
+    local rep = getRep(source, zoneId)
+    local heat = getHeat(zoneId)
+
+    if zoneLockdown[zoneId] and os.time() < zoneLockdown[zoneId] then
+        return nil
+    end
+
+    local spawnMult = getHeatSpawnMultiplier(zoneId)
+    if math.random() > spawnMult then return nil end
+
+    if not Config.VehicleBuyerArchetypes then return nil end
+
+    local pool = {}
+    local totalWeight = 0
+
+    for _, archetype in ipairs(Config.VehicleBuyerArchetypes) do
+        if rep >= archetype.minReputation then
+            local weight = archetype.baseWeight
+
+            -- Reduce weight in high heat (except undercover which increases)
+            if heat >= Config.DrugHeat.thresholds.dangerous then
+                if archetype.behavior == 'undercover' then
+                    weight = math.floor(weight * 2.0)
+                elseif archetype.behavior ~= 'robbery' then
+                    weight = math.floor(weight * 0.4)
+                end
+            end
+
+            if weight > 0 then
+                pool[#pool + 1] = { archetype = archetype, weight = weight }
+                totalWeight = totalWeight + weight
+            end
+        end
+    end
+
+    if #pool == 0 then return nil end
+
+    local roll = math.random() * totalWeight
+    local cumulative = 0
+    local selected = pool[1].archetype
+
+    for _, entry in ipairs(pool) do
+        cumulative = cumulative + entry.weight
+        if roll <= cumulative then
+            selected = entry.archetype
+            break
+        end
+    end
+
+    -- Determine item and quantity
+    local zoneConfig = nil
+    for _, z in ipairs(Config.DrugZones) do
+        if z.id == zoneId then zoneConfig = z break end
+    end
+
+    local requestedItem = zoneConfig and zoneConfig.items[math.random(#zoneConfig.items)] or 'weed_brick'
+    local qty = math.random(selected.quantityRange[1], selected.quantityRange[2])
+
+    return {
+        archetypeId = selected.id,
+        requestedItem = requestedItem,
+        quantity = qty,
+    }
+end)
+
+--- Process a vehicle robbery (steal items from player, add heat)
+lib.callback.register('qbx_pedscenarios:server:processVehicleRobbery', function(source, zoneId)
+    local player = exports.qbx_core:GetPlayer(source)
+    if not player then return { error = 'no_player' } end
+
+    -- Steal a random drug item the player has
+    local zoneConfig = nil
+    for _, z in ipairs(Config.DrugZones) do
+        if z.id == zoneId then zoneConfig = z break end
+    end
+
+    local stolenItems = {}
+    if zoneConfig then
+        for _, itemName in ipairs(zoneConfig.items) do
+            local count = exports.ox_inventory:GetItemCount(source, itemName)
+            if count and count > 0 then
+                local stealQty = math.min(count, math.random(1, 3))
+                local removed = exports.ox_inventory:RemoveItem(source, itemName, stealQty)
+                if removed then
+                    stolenItems[#stolenItems + 1] = { item = itemName, quantity = stealQty }
+                end
+            end
+        end
+    end
+
+    -- Significant heat for robbery
+    addHeat(zoneId, 6.0)
+    removeRep(source, zoneId, Config.Reputation.lossOnRiskEvent)
+
+    lib.print.warn(('Vehicle ROBBERY on player %s in zone "%s", stole %d item type(s)'):format(
+        source, zoneId, #stolenItems))
+
+    return {
+        result = 'robbed',
+        stolenItems = stolenItems,
+    }
+end)
+
+--- Generate wholesale inventory for a supplier vehicle
+lib.callback.register('qbx_pedscenarios:server:getSupplierInventory', function(source, zoneId)
+    local rep = getRep(source, zoneId)
+
+    local zoneConfig = nil
+    for _, z in ipairs(Config.DrugZones) do
+        if z.id == zoneId then zoneConfig = z break end
+    end
+
+    if not zoneConfig then return { items = {} } end
+
+    local offerings = {}
+
+    for _, itemName in ipairs(zoneConfig.items) do
+        local itemDef = Config.DrugItems[itemName]
+        if itemDef then
+            -- Wholesale: 0.7x base price, quantity 10-25
+            local qty = math.random(10, 25)
+            local pricePerUnit = math.floor(itemDef.basePrice * 0.7)
+
+            -- Slightly better price at higher rep
+            local repDiscount = (rep / Config.Reputation.maxReputation) * 0.10
+            pricePerUnit = math.floor(pricePerUnit * (1.0 - repDiscount))
+
+            offerings[#offerings + 1] = {
+                item = itemName,
+                label = itemDef.label,
+                quantity = qty,
+                pricePerUnit = pricePerUnit,
+                totalPrice = pricePerUnit * qty,
+            }
+        end
+    end
+
+    return { items = offerings }
+end)
+
+--- Process a supplier sale (player buys drugs from supplier)
+lib.callback.register('qbx_pedscenarios:server:processSupplierSale', function(source, zoneId, itemName, quantity, totalPrice)
+    local player = exports.qbx_core:GetPlayer(source)
+    if not player then return { error = 'no_player' } end
+
+    -- Verify item exists
+    local itemDef = Config.DrugItems[itemName]
+    if not itemDef then return { error = 'invalid_item' } end
+
+    -- Check cash
+    local cash = player.Functions.GetMoney('cash')
+    if cash < totalPrice then
+        return { error = 'no_cash' }
+    end
+
+    -- Take cash
+    local removed = player.Functions.RemoveMoney('cash', totalPrice, ('Supplier purchase: %dx %s'):format(quantity, itemName))
+    if not removed then
+        return { error = 'payment_failed' }
+    end
+
+    -- Give items
+    local added = exports.ox_inventory:AddItem(source, itemName, quantity)
+    if not added then
+        -- Refund if item add failed
+        player.Functions.AddMoney('cash', totalPrice, 'Supplier refund: item delivery failed')
+        return { error = 'item_failed' }
+    end
+
+    -- Adds heat because a transaction occurred
+    local heatGain = (itemDef.heatPerSale or 1.0) * quantity * 0.5
+    addHeat(zoneId, heatGain)
+
+    lib.print.info(('Player %s bought %dx %s from supplier for $%d'):format(
+        source, quantity, itemName, totalPrice))
+
+    return {
+        result = 'success',
+        item = itemName,
+        quantity = quantity,
+        totalPrice = totalPrice,
+    }
+end)
+
+--- Undercover dispatch event (triggers police notification)
+RegisterNetEvent('qbx_pedscenarios:server:sendUndercoverDispatch', function(zoneId)
+    local source = source
+
+    local zoneConfig = nil
+    for _, z in ipairs(Config.DrugZones) do
+        if z.id == zoneId then zoneConfig = z break end
+    end
+
+    if not zoneConfig then return end
+
+    -- Dispatch notification (compatible with ps-dispatch, cd_dispatch, etc.)
+    -- Try ps-dispatch first, then fallback
+    local dispatchExport = exports['ps-dispatch']
+    if dispatchExport then
+        pcall(function()
+            dispatchExport:SuspiciousActivity({
+                coords = zoneConfig.zone.coords,
+                description = 'Suspicious vehicle reported in drug area',
+            })
+        end)
+    end
+
+    -- Also add heat since undercover presence means police awareness
+    addHeat(zoneId, 1.0)
+
+    lib.print.info(('Undercover dispatch sent for zone "%s" by player %s'):format(zoneId, source))
 end)
 
 -- ============================================================================

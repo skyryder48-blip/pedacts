@@ -3,7 +3,7 @@ game 'gta5'
 lua54 'yes'
 
 name 'qbx_pedscenarios'
-description 'Dynamic ped scenario zones for QBX - Drug zones, Security zones, Bodyguard/Escort'
+description 'Dynamic ped scenario zones for QBX - Drug zones, Security zones'
 version '1.0.0'
 repository 'https://github.com/yourrepo/qbx_pedscenarios'
 
@@ -34,4 +34,5 @@ modules {
 dependencies {
     'ox_lib',
     'qbx_core',
+    'ox_inventory',
 }

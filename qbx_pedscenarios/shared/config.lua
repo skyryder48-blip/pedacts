@@ -45,12 +45,6 @@ Config.PedModels = {
         `s_m_y_marine_02`,
         `s_m_y_marine_03`,
     },
-    bodyguards = {
-        `s_m_m_bouncer_01`,
-        `s_m_m_security_01`,
-        `a_m_y_musclbeac_02`,
-        `g_m_m_armboss_01`,
-    },
 }
 
 -- ============================================================================
@@ -478,6 +472,13 @@ Config.DrugZones = {
             vec4(105.0, -1978.0, 21.1, 45.0),
             vec4(120.0, -1960.0, 21.1, 270.0),
         },
+        vehicleBuyer = {
+            enabled = true,
+            maxVehicles = 1,
+            cooldownMs = 45000,
+            spawnDistance = 80.0,
+            parkDistance = 15.0,
+        },
     },
     {
         id = 'strawberry_ave',
@@ -494,6 +495,13 @@ Config.DrugZones = {
         cooldownPerPedMs = 25000,
         items = { 'weed_brick', 'crack', 'oxy' },
         spawnPoints = {},
+        vehicleBuyer = {
+            enabled = true,
+            maxVehicles = 1,
+            cooldownMs = 55000,
+            spawnDistance = 70.0,
+            parkDistance = 12.0,
+        },
     },
 }
 
@@ -810,37 +818,138 @@ Config.SecurityZones = {
 }
 
 -- ============================================================================
--- BODYGUARD / ESCORT SETTINGS
+-- VEHICLE BUYER ARCHETYPES
+-- High risk / high reward buyers that approach in vehicles.
 -- ============================================================================
 
----@class BodyguardConfig
----@field maxBodyguards integer -- max active bodyguards per player
+---@class VehicleBuyerArchetype
+---@field id string
+---@field label string
 ---@field pedModels integer[]
----@field defaultWeapon integer
----@field followDistance number -- ideal follow distance
----@field combatRange number -- engage enemies within this range
----@field health integer -- ped max health
----@field armor integer -- ped armor value
----@field combatAbility integer -- 0 = poor, 1 = average, 2 = professional
----@field combatAttributes table<integer, boolean>
+---@field vehicles integer[] -- vehicle model hashes
+---@field baseWeight number
+---@field minReputation number
+---@field occupants integer[] -- {min, max} peds in the vehicle
+---@field quantityRange integer[] -- {min, max} items per deal
+---@field priceMultiplier number
+---@field patienceMs integer -- how long driver waits after parking
+---@field behavior string -- 'buy'|'robbery'|'supplier'|'undercover'
 
-Config.Bodyguard = {
-    maxBodyguards = 2,
-    pedModels = Config.PedModels.bodyguards,
-    defaultWeapon = `WEAPON_PISTOL`,
-    followDistance = 3.0,
-    combatRange = 30.0,
-    health = 300,
-    armor = 100,
-    combatAbility = 2,
-    combatAttributes = {
-        [0] = true,   -- CanUseCover
-        [1] = true,   -- CanUseVehicles
-        [2] = true,   -- CanDoDrivebys
-        [3] = true,   -- CanLeaveVehicle
-        [5] = true,   -- AlwaysFight
-        [46] = true,  -- CanFightArmedPedsWhenNotArmed
+Config.VehicleBuyerArchetypes = {
+    {
+        id = 'vehicle_bigbuyer',
+        label = 'Big Buyer',
+        pedModels = {
+            `g_m_y_mexgang_01`,
+            `g_m_y_famfor_01`,
+            `g_m_m_armboss_01`,
+            `a_m_y_business_03`,
+        },
+        vehicles = {
+            `schafter2`,
+            `oracle2`,
+            `fugitive`,
+            `tailgater`,
+            `emperor2`,
+        },
+        baseWeight = 30,
+        minReputation = 40,
+        occupants = { 1, 2 },
+        quantityRange = { 8, 15 },
+        priceMultiplier = 1.4,
+        patienceMs = 35000,
+        haggleChance = 0.5,
+        walkAwayThreshold = 0.30,
+        behavior = 'buy',
     },
+    {
+        id = 'vehicle_undercover',
+        label = 'Undercover',
+        pedModels = {
+            `s_m_y_cop_01`,
+            `a_m_y_business_01`,
+            `a_m_m_bevhills_02`,
+        },
+        vehicles = {
+            `washington`,
+            `stanier`,
+            `fugitive`,
+            `buffalo`,
+        },
+        baseWeight = 15,
+        minReputation = 0,
+        occupants = { 1, 2 },
+        quantityRange = { 1, 1 },
+        priceMultiplier = 1.0,
+        patienceMs = 40000,
+        haggleChance = 0.1,
+        walkAwayThreshold = 0.50,
+        behavior = 'undercover',
+        --- Dispatch notification interval (ms)
+        dispatchIntervalMs = 20000,
+    },
+    {
+        id = 'vehicle_robbery',
+        label = 'Robbery',
+        pedModels = {
+            `g_m_y_ballasout_01`,
+            `g_m_y_pologoon_01`,
+            `g_m_y_pologoon_02`,
+            `g_m_y_salvagoon_01`,
+        },
+        vehicles = {
+            `buccaneer`,
+            `manana`,
+            `emperor`,
+            `tornado`,
+            `primo`,
+        },
+        baseWeight = 15,
+        minReputation = 15,
+        occupants = { 2, 3 },
+        quantityRange = { 0, 0 },
+        priceMultiplier = 0.0,
+        patienceMs = 15000,
+        behavior = 'robbery',
+        --- Weapons given to occupants during robbery
+        weapons = { `WEAPON_PISTOL`, `WEAPON_MICROSMG` },
+    },
+    {
+        id = 'vehicle_supplier',
+        label = 'Supplier',
+        pedModels = {
+            `g_m_m_mexboss_01`,
+            `g_m_m_mexboss_02`,
+            `a_m_y_business_02`,
+            `g_m_m_chicold_01`,
+        },
+        vehicles = {
+            `dubsta`,
+            `baller`,
+            `cavalcade`,
+            `granger`,
+        },
+        baseWeight = 10,
+        minReputation = 60,
+        occupants = { 1, 2 },
+        quantityRange = { 10, 25 },
+        priceMultiplier = 0.7,
+        patienceMs = 30000,
+        behavior = 'supplier',
+    },
+}
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- PER-ZONE VEHICLE BUYER SETTINGS
+-- Added as a field to each DrugZone config above.
+-- ────────────────────────────────────────────────────────────────────────────
+
+Config.VehicleBuyerDefaults = {
+    maxVehicles = 1,             -- max simultaneous vehicle buyers per zone
+    cooldownMs = 45000,          -- min time between vehicle spawns
+    spawnDistance = 80.0,        -- how far away vehicles spawn (road node search)
+    parkDistance = 15.0,         -- how close to zone center they park
+    enabled = true,
 }
 
 return Config
