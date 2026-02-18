@@ -704,6 +704,13 @@ local function getTimeOfDayMultiplier()
 end
 
 -- ============================================================================
+-- FORWARD DECLARATIONS (vehicle buyer functions defined after zone lifecycle)
+-- ============================================================================
+
+local spawnVehicleBuyer       -- defined in VEHICLE BUYER SYSTEM section
+local cleanupAllVehicleBuyers -- defined in VEHICLE BUYER SYSTEM section
+
+-- ============================================================================
 -- ZONE LIFECYCLE
 -- ============================================================================
 
@@ -1408,7 +1415,7 @@ end
 -- ────────────────────────────────────────────────────────────────────────────
 
 ---@param zoneConfig DrugZoneConfig
-local function spawnVehicleBuyer(zoneConfig)
+spawnVehicleBuyer = function(zoneConfig)
     local vbSettings = zoneConfig.vehicleBuyer or Config.VehicleBuyerDefaults
     if not vbSettings.enabled then return end
 
@@ -1515,7 +1522,7 @@ end
 -- VEHICLE BUYER CLEANUP (called from zone exit and resource stop)
 -- ────────────────────────────────────────────────────────────────────────────
 
-local function cleanupAllVehicleBuyers(zoneId)
+cleanupAllVehicleBuyers = function(zoneId)
     for driverPed, vData in pairs(vehicleBuyers) do
         if not zoneId or vData.zoneId == zoneId then
             cleanupVehicleBuyer(driverPed)

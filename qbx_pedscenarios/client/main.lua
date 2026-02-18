@@ -8,6 +8,10 @@
 
 local initialized = false
 
+--- Register relationship groups used by scenario peds
+AddRelationshipGroup('DRUGBUYER_GROUP')
+AddRelationshipGroup('SECURITY_GUARD')
+
 --- Wait for player to be fully loaded and ready
 local function waitForReady()
     while not QBX or not QBX.PlayerData or not QBX.PlayerData.citizenid do
@@ -15,15 +19,26 @@ local function waitForReady()
     end
 end
 
+--- Initialize all scenario zones (safe to call multiple times; skips if already init'd)
+local function initAllScenarios()
+    if initialized then return end
+    InitDrugZones()
+    InitSecurityZones()
+    initialized = true
+    lib.print.info('qbx_pedscenarios: All scenarios initialized.')
+end
+
+--- Clean up all scenario zones and reset state
+local function cleanupAllScenarios()
+    initialized = false
+    CleanupDrugZones()
+    CleanupSecurityZones()
+end
+
 CreateThread(function()
     waitForReady()
     Wait(2000) -- Extra buffer for world to load
-
-    InitDrugZones()
-    InitSecurityZones()
-
-    initialized = true
-    lib.print.info('qbx_pedscenarios: All scenarios initialized.')
+    initAllScenarios()
 end)
 
 -- ============================================================================
@@ -39,11 +54,9 @@ RegisterCommand('pedscenarios_debug', function()
         type = 'inform',
     })
     -- Restart zones with new debug state
-    CleanupDrugZones()
-    CleanupSecurityZones()
+    cleanupAllScenarios()
     Wait(500)
-    InitDrugZones()
-    InitSecurityZones()
+    initAllScenarios()
 end, false)
 
 -- ============================================================================
@@ -139,19 +152,22 @@ end
 -- Full cleanup on resource stop (also handled in utils.lua for peds)
 AddEventHandler('onResourceStop', function(resource)
     if resource == GetCurrentResourceName() then
-        CleanupDrugZones()
-        CleanupSecurityZones()
+        cleanupAllScenarios()
     end
 end)
 
 -- Character logout: full cleanup
 RegisterNetEvent('qbx_core:client:onLogout', function()
-    CleanupDrugZones()
-    CleanupSecurityZones()
-    initialized = false
+    cleanupAllScenarios()
 end)
 
--- Character login: reinitialize
+-- Character login: reinitialize zones after logout or character switch
+RegisterNetEvent('qbx_core:client:onPlayerLoaded', function()
+    if initialized then return end
+    Wait(2000) -- Buffer for world streaming after character load
+    initAllScenarios()
+end)
+
+-- Job update hook (could be used to gate certain zones by job)
 RegisterNetEvent('qbx_core:client:onJobUpdate', function()
-    -- Could be used to gate certain zones by job
 end)
