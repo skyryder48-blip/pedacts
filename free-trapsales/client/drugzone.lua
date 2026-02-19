@@ -285,8 +285,8 @@ local function runNegotiation(ped, data)
         local accepted = nil
 
         while not accepted do
-            local headerText = ('**%s** wants %dx %s'):format(
-                archetype.label, offer.quantity, offer.itemLabel)
+            local headerText = ('**Buyer** wants %dx %s'):format(
+                offer.quantity, offer.itemLabel)
 
             local options = {
                 {
@@ -618,7 +618,19 @@ local function spawnBuyer(zoneConfig)
         patienceExpiry = 0,
     }
 
-    taskIdleScenario(leadPed, archetype)
+    -- Walk towards the zone center so the ped looks natural (wanders in the area)
+    local zoneCenter = zoneConfig.zone.coords
+    ClearPedTasks(leadPed)
+    TaskWanderInArea(leadPed, zoneCenter.x, zoneCenter.y, zoneCenter.z, zoneConfig.approachRadius or 15.0, 1.0, 1.0)
+    SetPedKeepTask(leadPed, true)
+
+    -- Group members follow the lead ped
+    for _, gPed in ipairs(groupPeds) do
+        if DoesEntityExist(gPed) then
+            ClearPedTasks(gPed)
+            TaskFollowToOffsetOfEntity(gPed, leadPed, -1.0, -1.0, 0.0, 1.0, -1, 1.5, true)
+        end
+    end
 end
 
 -- ============================================================================
@@ -668,7 +680,7 @@ local function updateBuyers(zoneConfig)
 
                 lib.notify({
                     title = 'Drug Zone',
-                    description = ('A %s wants to talk...'):format(archetype.label:lower()),
+                    description = 'Someone wants to talk...',
                     type = 'inform', duration = 4000,
                 })
 
@@ -948,7 +960,8 @@ local function findVehicleSpawnNode(zoneCoords, spawnDistance)
     return nil, nil
 end
 
---- Find a road node near the zone center for parking
+--- Find a road-side parking spot near the zone center.
+--- Uses GetPointOnRoadSide to place vehicles at the curb rather than in traffic lanes.
 ---@param zoneCoords vector3
 ---@param parkDistance number
 ---@return vector3?, number?
@@ -959,6 +972,16 @@ local function findParkingNode(zoneCoords, parkDistance)
         local x = zoneCoords.x + math.cos(angle) * dist
         local y = zoneCoords.y + math.sin(angle) * dist
 
+        -- Try to get a road-side position (curb) first
+        local sideFound, sidePos = GetPointOnRoadSide(x, y, zoneCoords.z, 0)
+        if sideFound then
+            -- Get the nearest vehicle node heading so the car parks aligned with the road
+            local headingFound, _, heading = GetClosestVehicleNodeWithHeading(sidePos.x, sidePos.y, sidePos.z, 1, 3.0, 0)
+            local parkHeading = headingFound and heading or 0.0
+            return vec3(sidePos.x, sidePos.y, sidePos.z), parkHeading
+        end
+
+        -- Fallback to standard vehicle node
         local found, nodePos, heading = GetClosestVehicleNodeWithHeading(x, y, zoneCoords.z, 1, 3.0, 0)
         if found then
             return vec3(nodePos.x, nodePos.y, nodePos.z), heading
@@ -1026,7 +1049,7 @@ local function vehicleDriveAwayAndCleanup(driverPed)
     SetVehicleHandbrake(vehicle, false)
     ClearPedTasks(driverPed)
     SetBlockingOfNonTemporaryEvents(driverPed, true)
-    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 786603)
+    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 262669)
 
     -- Delayed cleanup
     SetTimeout(20000, function()
@@ -1372,8 +1395,10 @@ local function startVehicleBuyerBehavior(driverPed, zoneConfig)
     end
 
     -- Phase 1: Drive to parking spot
+    -- Driving style 262144 + 512 + 8 + 4 + 2 + 1 = 262669
+    -- Obey traffic lights, stop before vehicles, avoid empty vehicles, take shortest path
     data.state = VehicleState.DRIVING_IN
-    TaskVehicleDriveToCoordLongrange(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, 18.0, 786603, 5.0)
+    TaskVehicleDriveToCoordLongrange(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, 15.0, 262669, 5.0)
 
     -- Wait for arrival
     local arrivalTimeout = GetGameTimer() + 30000
