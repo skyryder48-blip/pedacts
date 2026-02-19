@@ -3,9 +3,9 @@
 --- negotiation validation, sale processing.
 --- All state is server-authoritative — clients request, server decides.
 ---
---- PERSISTENCE: Reputation stored per citizenid/zone in `pedscenarios_drug_rep`.
---- Zone heat stored in `pedscenarios_zone_heat` and survives restarts.
---- Run sql/migration.sql before first use.
+--- PERSISTENCE: Reputation stored per citizenid/zone in `trapsales_drug_rep`.
+--- Zone heat stored in `trapsales_zone_heat` and survives restarts.
+--- Run sql/install.sql before first use.
 
 -- ============================================================================
 -- STATE (in-memory cache, backed by database)
@@ -125,7 +125,7 @@ end
 ---@param citizenid string
 local function loadPlayerRep(source, citizenid)
     local rows = MySQL.query.await(
-        'SELECT zone_id, reputation, total_sales, total_earned FROM pedscenarios_drug_rep WHERE citizenid = ?',
+        'SELECT zone_id, reputation, total_sales, total_earned FROM trapsales_drug_rep WHERE citizenid = ?',
         { citizenid }
     )
 
@@ -154,7 +154,7 @@ end
 ---@param totalEarned integer
 local function savePlayerRepZone(citizenid, zoneId, reputation, totalSales, totalEarned)
     MySQL.insert.await(
-        [[INSERT INTO pedscenarios_drug_rep (citizenid, zone_id, reputation, total_sales, total_earned, last_sale_at)
+        [[INSERT INTO trapsales_drug_rep (citizenid, zone_id, reputation, total_sales, total_earned, last_sale_at)
           VALUES (?, ?, ?, ?, ?, NOW())
           ON DUPLICATE KEY UPDATE
               reputation = VALUES(reputation),
@@ -192,7 +192,7 @@ end
 
 --- Load all zone heat from database on resource start
 local function loadAllZoneHeat()
-    local rows = MySQL.query.await('SELECT zone_id, heat, lockdown_until FROM pedscenarios_zone_heat')
+    local rows = MySQL.query.await('SELECT zone_id, heat, lockdown_until FROM trapsales_zone_heat')
 
     if rows then
         for _, row in ipairs(rows) do
@@ -232,7 +232,7 @@ local function saveZoneHeat(zoneId)
     end
 
     MySQL.insert.await(
-        [[INSERT INTO pedscenarios_zone_heat (zone_id, heat, lockdown_until)
+        [[INSERT INTO trapsales_zone_heat (zone_id, heat, lockdown_until)
           VALUES (?, ?, ?)
           ON DUPLICATE KEY UPDATE
               heat = VALUES(heat),
@@ -579,6 +579,9 @@ lib.callback.register('free-trapsales:server:getDrugZoneState', function(source,
     local rep = getRep(source, zoneId)
     local isLocked = zoneLockdown[zoneId] and os.time() < zoneLockdown[zoneId] or false
 
+    lib.print.info(('[free-trapsales] getDrugZoneState: src=%d zone=%s heat=%.1f spawnMult=%.2f rep=%.0f lockdown=%s'):format(
+        source, tostring(zoneId), heat, spawnMult, rep, tostring(isLocked)))
+
     return {
         heat = heat,
         spawnMultiplier = spawnMult,
@@ -592,12 +595,19 @@ lib.callback.register('free-trapsales:server:rollBuyerSpawn', function(source, z
     local rep = getRep(source, zoneId)
     local heat = getHeat(zoneId)
 
+    lib.print.info(('[free-trapsales] rollBuyerSpawn: src=%d zone=%s hour=%s rep=%.0f heat=%.1f'):format(
+        source, tostring(zoneId), tostring(gameHour), rep, heat))
+
     if zoneLockdown[zoneId] and os.time() < zoneLockdown[zoneId] then
+        lib.print.info('[free-trapsales] rollBuyerSpawn: zone in lockdown, returning nil')
         return nil
     end
 
     local spawnMult = getHeatSpawnMultiplier(zoneId)
-    if math.random() > spawnMult then return nil end
+    if math.random() > spawnMult then
+        lib.print.info(('[free-trapsales] rollBuyerSpawn: heat roll failed (spawnMult=%.2f)'):format(spawnMult))
+        return nil
+    end
 
     local pool = {}
     local totalWeight = 0
@@ -634,7 +644,12 @@ lib.callback.register('free-trapsales:server:rollBuyerSpawn', function(source, z
         end
     end
 
-    if #pool == 0 then return nil end
+    if #pool == 0 then
+        lib.print.info('[free-trapsales] rollBuyerSpawn: empty archetype pool, returning nil')
+        return nil
+    end
+
+    lib.print.info(('[free-trapsales] rollBuyerSpawn: %d archetype(s) in pool, totalWeight=%.0f'):format(#pool, totalWeight))
 
     local roll = math.random() * totalWeight
     local cumulative = 0
@@ -657,6 +672,9 @@ lib.callback.register('free-trapsales:server:rollBuyerSpawn', function(source, z
 
     local requestedItem = zoneConfig and zoneConfig.items[math.random(#zoneConfig.items)] or 'weed_brick'
     local qty = math.random(selected.quantityRange[1], selected.quantityRange[2])
+
+    lib.print.info(('[free-trapsales] rollBuyerSpawn: SUCCESS — archetype=%s item=%s qty=%d group=%d'):format(
+        selected.id, requestedItem, qty, groupSize))
 
     return {
         archetypeId = selected.id,
