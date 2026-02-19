@@ -1740,7 +1740,6 @@ local function detectionTick(zoneId, zoneConfig)
             else
                 data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
             end
-        end
 
         ::nextGuard::
     end
@@ -1934,6 +1933,11 @@ end
 -- ============================================================================
 
 function InitSecurityZones()
+    if next(secZones) then
+        lib.print.warn('InitSecurityZones: zones already exist, skipping duplicate init')
+        return
+    end
+
     for _, config in ipairs(Config.SecurityZones) do
         local zoneId = config.id
 

@@ -20,19 +20,38 @@ local function waitForReady()
 end
 
 --- Initialize all scenario zones (safe to call multiple times; skips if already init'd)
+--- Each subsystem is pcall-protected so one failure doesn't block the other.
 local function initAllScenarios()
     if initialized then return end
-    InitDrugZones()
-    InitSecurityZones()
+
+    local drugOk, drugErr = pcall(InitDrugZones)
+    if not drugOk then
+        lib.print.error(('InitDrugZones failed: %s'):format(tostring(drugErr)))
+    end
+
+    local secOk, secErr = pcall(InitSecurityZones)
+    if not secOk then
+        lib.print.error(('InitSecurityZones failed: %s'):format(tostring(secErr)))
+    end
+
     initialized = true
     lib.print.info('qbx_pedscenarios: All scenarios initialized.')
 end
 
 --- Clean up all scenario zones and reset state
+--- Each subsystem is pcall-protected so one failure doesn't block the other.
 local function cleanupAllScenarios()
     initialized = false
-    CleanupDrugZones()
-    CleanupSecurityZones()
+
+    local drugOk, drugErr = pcall(CleanupDrugZones)
+    if not drugOk then
+        lib.print.error(('CleanupDrugZones failed: %s'):format(tostring(drugErr)))
+    end
+
+    local secOk, secErr = pcall(CleanupSecurityZones)
+    if not secOk then
+        lib.print.error(('CleanupSecurityZones failed: %s'):format(tostring(secErr)))
+    end
 end
 
 CreateThread(function()
