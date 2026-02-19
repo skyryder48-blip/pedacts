@@ -870,6 +870,17 @@ lib.callback.register('qbx_pedscenarios:server:completeSale', function(source, a
         awardGangRep(source, session.zoneId, gangRepConfig, session.quantity)
     end
 
+    -- Process external drug sale through free-gangs (XP, rep, influence, heat, stats, market, dispatch)
+    if isFreeGangsActive() then
+        local ok, gangSuccess, gangRewards = pcall(exports['free-gangs'].ProcessExternalDrugSale, exports['free-gangs'], source, session.itemName, session.quantity, finalPrice)
+        if ok and gangSuccess then
+            lib.print.info(('free-gangs ProcessExternalDrugSale: player %s sold %dx %s for $%d'):format(
+                source, session.quantity, session.itemName, finalPrice))
+        elseif not ok then
+            lib.print.warn(('free-gangs ProcessExternalDrugSale failed: %s'):format(tostring(gangSuccess)))
+        end
+    end
+
     lib.print.info(('Player %s sold %dx %s for $%d in zone "%s" | Rep: %.0f | Heat: %.1f'):format(
         source, session.quantity, session.itemName, finalPrice, session.zoneId, newRep, newHeat
     ))
