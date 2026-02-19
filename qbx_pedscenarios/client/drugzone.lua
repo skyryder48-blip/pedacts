@@ -715,6 +715,11 @@ local cleanupAllVehicleBuyers -- defined in VEHICLE BUYER SYSTEM section
 -- ============================================================================
 
 function InitDrugZones()
+    if next(zones) then
+        lib.print.warn('InitDrugZones: zones already exist, skipping duplicate init')
+        return
+    end
+
     for _, config in ipairs(Config.DrugZones) do
         local zoneId = config.id
 
