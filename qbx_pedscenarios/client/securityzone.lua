@@ -1740,6 +1740,7 @@ local function detectionTick(zoneId, zoneConfig)
             else
                 data.suspicion = math.max(data.suspicion - Config.Stealth.suspicionDecayRate, 0)
             end
+        end
 
         ::nextGuard::
     end
