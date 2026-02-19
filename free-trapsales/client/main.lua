@@ -42,7 +42,9 @@ local function cleanupAllScenarios()
 end
 
 CreateThread(function()
+    lib.print.info('[free-trapsales] Waiting for player to be ready...')
     waitForReady()
+    lib.print.info('[free-trapsales] Player ready, waiting 2s for world streaming...')
     Wait(2000) -- Extra buffer for world to load
     initAllScenarios()
 end)

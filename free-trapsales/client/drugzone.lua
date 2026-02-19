@@ -554,20 +554,41 @@ end
 local function spawnBuyer(zoneConfig)
     local gameHour = GetClockHours()
 
+    lib.print.info(('[free-trapsales] spawnBuyer: requesting roll for zone=%s hour=%d'):format(zoneConfig.id, gameHour))
+
     local spawnData = lib.callback.await('free-trapsales:server:rollBuyerSpawn', false,
         zoneConfig.id, gameHour)
 
-    if not spawnData then return end
+    if not spawnData then
+        lib.print.info('[free-trapsales] spawnBuyer: server returned nil (heat/lockdown/rng skip)')
+        return
+    end
+
+    lib.print.info(('[free-trapsales] spawnBuyer: server rolled archetype=%s item=%s qty=%d'):format(
+        spawnData.archetypeId, spawnData.requestedItem, spawnData.quantity))
 
     local archetype = getArchetype(spawnData.archetypeId)
-    if not archetype then return end
+    if not archetype then
+        lib.print.warn(('[free-trapsales] spawnBuyer: unknown archetype "%s"'):format(spawnData.archetypeId))
+        return
+    end
 
     local spawnPoint = pickSpawnPoint(zoneConfig)
-    if not spawnPoint then return end
+    if not spawnPoint then
+        lib.print.warn('[free-trapsales] spawnBuyer: no valid spawn point found')
+        return
+    end
+
+    lib.print.info(('[free-trapsales] spawnBuyer: spawn point at %.1f, %.1f, %.1f'):format(spawnPoint.x, spawnPoint.y, spawnPoint.z))
 
     local modelHash = PickRandom(archetype.pedModels)
     local leadPed = SpawnScenarioPed(modelHash, spawnPoint, spawnPoint.w, 0)
-    if not leadPed then return end
+    if not leadPed then
+        lib.print.warn(('[free-trapsales] spawnBuyer: SpawnScenarioPed returned nil for model 0x%X'):format(modelHash))
+        return
+    end
+
+    lib.print.info(('[free-trapsales] spawnBuyer: SUCCESS — ped %d spawned for %s'):format(leadPed, spawnData.archetypeId))
 
     SetPedRelationshipGroupHash(leadPed, `DRUGBUYER_GROUP`)
 
@@ -716,9 +737,11 @@ local cleanupAllVehicleBuyers -- defined in VEHICLE BUYER SYSTEM section
 
 function InitDrugZones()
     if next(zones) then
-        lib.print.warn('InitDrugZones: zones already exist, skipping duplicate init')
+        lib.print.warn('[free-trapsales] InitDrugZones: zones already exist, skipping duplicate init')
         return
     end
+
+    lib.print.info(('[free-trapsales] InitDrugZones: creating %d zone(s)'):format(#Config.DrugZones))
 
     for _, config in ipairs(Config.DrugZones) do
         local zoneId = config.id
@@ -732,75 +755,92 @@ function InitDrugZones()
 
             onEnter = function()
                 if zoneCooldowns[zoneId] and GetGameTimer() < zoneCooldowns[zoneId] then return end
+                if zoneActive[zoneId] then return end -- already active (re-entrant guard)
 
-                local state = lib.callback.await('free-trapsales:server:getDrugZoneState', false, zoneId)
-
-                if state and state.isLockdown then
-                    lib.notify({
-                        title = 'Drug Zone',
-                        description = 'This area is too hot right now. Come back later.',
-                        type = 'error', duration = 5000,
-                    })
-                    return
-                end
-
-                zoneActive[zoneId] = true
-                lib.print.info(('Entered drug zone: %s | Heat: %.1f | Rep: %.0f'):format(
-                    config.label, state and state.heat or 0, state and state.reputation or 0))
-
-                -- Initial spawns (staggered)
+                -- IMPORTANT: Run in a separate thread so we don't block the
+                -- ox_lib zone polling thread with lib.callback.await calls.
                 CreateThread(function()
-                    for _ = 1, config.maxPeds do
-                        if not zoneActive[zoneId] then return end
-                        if math.random() < getTimeOfDayMultiplier() then
-                            spawnBuyer(config)
-                        end
-                        Wait(math.random(800, 1500))
+                    lib.print.info(('[free-trapsales] Zone onEnter fired: %s — fetching state from server'):format(zoneId))
+
+                    local state = lib.callback.await('free-trapsales:server:getDrugZoneState', false, zoneId)
+
+                    lib.print.info(('[free-trapsales] Server state for %s: heat=%.1f lockdown=%s'):format(
+                        zoneId, state and state.heat or -1, tostring(state and state.isLockdown)))
+
+                    if state and state.isLockdown then
+                        lib.notify({
+                            title = 'Drug Zone',
+                            description = 'This area is too hot right now. Come back later.',
+                            type = 'error', duration = 5000,
+                        })
+                        return
                     end
-                end)
 
-                -- Behavior ticks (500ms)
-                CreateThread(function()
-                    while zoneActive[zoneId] do
-                        updateBuyers(config)
-                        Wait(500)
-                    end
-                end)
+                    zoneActive[zoneId] = true
+                    lib.print.info(('[free-trapsales] Entered drug zone: %s | Heat: %.1f | Rep: %.0f'):format(
+                        config.label, state and state.heat or 0, state and state.reputation or 0))
 
-                -- Replenishment loop
-                CreateThread(function()
-                    while zoneActive[zoneId] do
-                        Wait(config.cooldownPerPedMs)
-                        if not zoneActive[zoneId] then return end
-
-                        local count = 0
-                        for _, d in pairs(buyerPeds) do
-                            if d.zoneId == zoneId and d.state ~= PedState.LEAVING and d.state ~= PedState.RISK then
-                                count = count + 1
-                            end
-                        end
-
-                        if count < config.maxPeds and math.random() < getTimeOfDayMultiplier() then
-                            spawnBuyer(config)
-                        end
-                    end
-                end)
-
-                -- Vehicle buyer spawn loop
-                local vbSettings = config.vehicleBuyer or Config.VehicleBuyerDefaults
-                if vbSettings.enabled then
+                    -- Initial spawns (staggered)
                     CreateThread(function()
-                        -- Initial delay before first vehicle
-                        Wait(math.random(15000, 30000))
+                        local todMult = getTimeOfDayMultiplier()
+                        lib.print.info(('[free-trapsales] Starting initial spawns for %s | maxPeds=%d | todMult=%.2f'):format(
+                            zoneId, config.maxPeds, todMult))
 
-                        while zoneActive[zoneId] do
-                            if math.random() < getTimeOfDayMultiplier() * 0.5 then
-                                spawnVehicleBuyer(config)
+                        for i = 1, config.maxPeds do
+                            if not zoneActive[zoneId] then return end
+                            if math.random() < todMult then
+                                lib.print.info(('[free-trapsales] Spawning buyer %d/%d in %s'):format(i, config.maxPeds, zoneId))
+                                spawnBuyer(config)
+                            else
+                                lib.print.info(('[free-trapsales] Skipped buyer %d/%d (todMult roll failed)'):format(i, config.maxPeds))
                             end
-                            Wait(vbSettings.cooldownMs)
+                            Wait(math.random(800, 1500))
                         end
                     end)
-                end
+
+                    -- Behavior ticks (500ms)
+                    CreateThread(function()
+                        while zoneActive[zoneId] do
+                            updateBuyers(config)
+                            Wait(500)
+                        end
+                    end)
+
+                    -- Replenishment loop
+                    CreateThread(function()
+                        while zoneActive[zoneId] do
+                            Wait(config.cooldownPerPedMs)
+                            if not zoneActive[zoneId] then return end
+
+                            local count = 0
+                            for _, d in pairs(buyerPeds) do
+                                if d.zoneId == zoneId and d.state ~= PedState.LEAVING and d.state ~= PedState.RISK then
+                                    count = count + 1
+                                end
+                            end
+
+                            if count < config.maxPeds and math.random() < getTimeOfDayMultiplier() then
+                                spawnBuyer(config)
+                            end
+                        end
+                    end)
+
+                    -- Vehicle buyer spawn loop
+                    local vbSettings = config.vehicleBuyer or Config.VehicleBuyerDefaults
+                    if vbSettings.enabled then
+                        CreateThread(function()
+                            -- Initial delay before first vehicle
+                            Wait(math.random(15000, 30000))
+
+                            while zoneActive[zoneId] do
+                                if math.random() < getTimeOfDayMultiplier() * 0.5 then
+                                    spawnVehicleBuyer(config)
+                                end
+                                Wait(vbSettings.cooldownMs)
+                            end
+                        end)
+                    end
+                end)
             end,
 
             onExit = function()
@@ -827,7 +867,13 @@ function InitDrugZones()
         }
 
         zones[zoneId] = lib.zones[config.zone.type](zoneData)
+        lib.print.info(('[free-trapsales] Created zone: %s (%s at %.0f, %.0f, %.0f r=%.0f)'):format(
+            zoneId, config.zone.type,
+            config.zone.coords.x, config.zone.coords.y, config.zone.coords.z,
+            config.zone.radius or 0))
     end
+
+    lib.print.info('[free-trapsales] InitDrugZones: all zones created')
 end
 
 function CleanupDrugZones()
