@@ -395,7 +395,7 @@ Config.Negotiation = {
     --- The buyer's opening offer is this fraction of the "fair" price
     openingOfferFraction = 0.75,
     --- Maximum counter-offers before buyer walks
-    maxRounds = 3,
+    maxRounds = 2,
     --- Duration of sale animation / progress bar (ms)
     saleDurationMs = 4000,
 }

@@ -702,11 +702,12 @@ lib.callback.register('free-trapsales:server:startNegotiation', function(source,
         archetypeId = archetypeId,
         itemName = itemName,
         quantity = quantity,
+        originalQuantity = quantity,
         fairPrice = totalFair,
         perUnit = perUnit,
         currentOffer = openingOffer,
-        round = 1,
-        maxRounds = Config.Negotiation.maxRounds,
+        originalOffer = openingOffer,
+        round = 0,
     }
 
     local itemDef = Config.DrugItems[itemName]
@@ -717,13 +718,11 @@ lib.callback.register('free-trapsales:server:startNegotiation', function(source,
         buyerOffer = openingOffer,
         fairPrice = totalFair,
         perUnit = perUnit,
-        round = 1,
-        maxRounds = Config.Negotiation.maxRounds,
     }
 end)
 
---- Counter-offer
-lib.callback.register('free-trapsales:server:counterOffer', function(source, counterPrice)
+--- Counter-offer (price + quantity)
+lib.callback.register('free-trapsales:server:counterOffer', function(source, counterPrice, counterQty)
     local session = negotiations[source]
     if not session then return { error = 'no_session' } end
 
@@ -738,36 +737,37 @@ lib.callback.register('free-trapsales:server:counterOffer', function(source, cou
     end
     if not archetype then return { error = 'invalid' } end
 
-    local greedRatio = (counterPrice - session.fairPrice) / session.fairPrice
+    session.round = session.round + 1
+    counterQty = math.max(1, math.min(counterQty or session.quantity, session.originalQuantity))
 
-    if greedRatio > archetype.walkAwayThreshold then
+    -- Walk-away chance increases each round
+    local walkAwayChance = (archetype.walkAwayThreshold or 0.20) * session.round
+    -- Also influenced by greed: asking for much more than fair price increases walk-away
+    local adjustedFair = session.perUnit * counterQty
+    if counterPrice > adjustedFair then
+        local greedRatio = (counterPrice - adjustedFair) / math.max(adjustedFair, 1)
+        walkAwayChance = walkAwayChance + greedRatio
+    end
+
+    if math.random() < walkAwayChance then
         negotiations[source] = nil
         removeRep(source, session.zoneId, Config.Reputation.lossOnRefuseSale)
-        return { result = 'walked_away', reason = 'too_greedy' }
+        return { result = 'walked_away' }
     end
 
-    if counterPrice <= session.fairPrice then
+    -- If player's counter is at or below fair value for the quantity, accept it
+    if counterPrice <= adjustedFair then
         session.currentOffer = counterPrice
+        session.quantity = counterQty
         return { result = 'accepted', finalPrice = counterPrice }
     end
 
-    session.round = session.round + 1
-
-    if session.round > session.maxRounds then
-        local finalOffer = math.floor(session.fairPrice * 0.95)
-        session.currentOffer = finalOffer
-        return { result = 'final_offer', finalPrice = finalOffer, round = session.round }
-    end
-
-    if math.random() < archetype.haggleChance then
-        local newOffer = math.floor((session.currentOffer + counterPrice) / 2)
-        newOffer = math.max(newOffer, session.currentOffer)
-        session.currentOffer = newOffer
-        return { result = 'counter', buyerOffer = newOffer, round = session.round, maxRounds = session.maxRounds }
-    else
-        session.currentOffer = counterPrice
-        return { result = 'accepted', finalPrice = counterPrice }
-    end
+    -- Buyer sticks with their original offer (original price for original quantity)
+    return {
+        result = 'original',
+        originalPrice = session.originalOffer,
+        originalQty = session.originalQuantity,
+    }
 end)
 
 --- Complete sale
