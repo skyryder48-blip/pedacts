@@ -86,9 +86,7 @@ local function pickSpawnPoint(zoneConfig)
             local spawnPos = vec3(point.x, point.y, point.z)
             local dist = #(playerCoords - spawnPos)
             if dist > 12.0 and dist < zoneConfig.spawnRadius * 1.5 then
-                if not HasEntityClearLosToCoord(cache.ped, point.x, point.y, point.z + 1.0, 17) then
-                    return point
-                end
+                return point
             end
         end
 
@@ -100,7 +98,7 @@ local function pickSpawnPoint(zoneConfig)
         end
     end
 
-    -- Random scatter fallback with LOS check
+    -- Random scatter fallback
     for _ = 1, 15 do
         local angle = math.random() * 2 * math.pi
         local dist = 12.0 + math.random() * (zoneConfig.spawnRadius - 12.0)
@@ -110,9 +108,7 @@ local function pickSpawnPoint(zoneConfig)
 
         local found, groundZ = GetGroundZFor_3dCoord(x, y, z + 50.0, false)
         if found and #(playerCoords - vec3(x, y, groundZ)) > 12.0 then
-            if not HasEntityClearLosToCoord(cache.ped, x, y, groundZ + 1.0, 17) then
-                return vec4(x, y, groundZ, math.random(0, 359) + 0.0)
-            end
+            return vec4(x, y, groundZ, math.random(0, 359) + 0.0)
         end
     end
 
