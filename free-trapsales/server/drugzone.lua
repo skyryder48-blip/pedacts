@@ -1204,3 +1204,13 @@ local function setPlayerDrugRep(source, zoneId, rep)
 end
 
 exports('SetPlayerDrugRep', setPlayerDrugRep)
+
+-- Exports used by the delivery system (server/delivery.lua)
+exports('GetPlayerDrugRep', function(source, zoneId) return getRep(source, zoneId) end)
+exports('AddPlayerDrugRep', function(source, zoneId, amount) addRep(source, zoneId, amount) end)
+exports('RemovePlayerDrugRep', function(source, zoneId, amount) removeRep(source, zoneId, amount) end)
+exports('GetZoneHeat', function(zoneId) return getHeat(zoneId) end)
+exports('AddZoneHeat', function(zoneId, amount) addHeat(zoneId, amount) end)
+exports('RecordSale', function(source, zoneId, payment) recordSale(source, zoneId, payment) end)
+exports('CalculateFairPrice', function(itemName, archetypeId, qty, source, zoneId) return calculateFairPrice(itemName, archetypeId, qty, source, zoneId) end)
+exports('RollRiskEvent', function(zoneId, itemName, source) return rollRiskEvent(zoneId, itemName, source) end)

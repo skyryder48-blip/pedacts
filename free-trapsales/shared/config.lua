@@ -667,4 +667,165 @@ Config.GangIntegration = {
     },
 }
 
+-- ============================================================================
+-- TRAP PHONE — DELIVERY SYSTEM
+-- Phone-based drug delivery orders. Players use a trap_phone item to receive
+-- messages from contacts requesting drug deliveries around the map.
+-- ============================================================================
+
+Config.TrapPhone = {
+    --- Cooldown between phone uses (ms)
+    cooldownMs = 300000, -- 5 min
+
+    --- How long generated messages last before expiring (ms)
+    messageExpiryMs = 120000, -- 2 min
+
+    --- How long the player has to complete a delivery after accepting (ms)
+    deliveryTimeoutMs = 600000, -- 10 min
+
+    --- Number of contacts shown per phone check
+    minContacts = 1,
+    maxContacts = 4,
+
+    --- Payment multiplier vs zone base prices (delivery premium)
+    paymentMultiplier = 1.15,
+
+    --- Blip settings for active delivery
+    blip = {
+        sprite = 501,        -- drug package icon
+        colour = 2,          -- green
+        scale = 0.8,
+        shortRange = false,
+    },
+
+    --- Small-time orders (default tier)
+    smallTime = {
+        quantityRange = { 2, 10 },
+        maxOrders = 2,        -- max different drug types per contact
+    },
+
+    --- Distribution network (unlocked at rep threshold)
+    distribution = {
+        repThreshold = 50,    -- min drug rep to unlock
+        quantityRange = { 10, 30 },
+        maxOrders = 3,
+        paymentMultiplier = 1.3, -- additional bonus on top of base delivery multiplier
+    },
+
+    --- Risk chance per delivery (chance of ambush/bust at drop-off)
+    deliveryRiskChance = 0.12,
+
+    --- Heat added per completed delivery
+    heatPerDelivery = 2.0,
+
+    --- Rep gained per completed delivery
+    repPerDelivery = 3,
+
+    --- Contact name pools (first and last picked randomly)
+    contactFirstNames = {
+        'Lil', 'Big', 'Young', 'OG', 'Baby', 'Slim', 'Fat',
+        'Rico', 'Dex', 'Tre', 'Moe', 'Jay', 'TJ', 'AK',
+        'Boogie', 'Smoke', 'Ghost', 'Shadow', 'Ice', 'Blaze',
+    },
+    contactLastNames = {
+        'D', 'Money', 'Loc', 'G', 'B', 'Mac', 'Tha Kid',
+        'Da Don', 'Capone', 'Diaz', 'Montana', 'Cruz',
+        'from the block', 'downtown', 'uptown', 'eastside',
+    },
+
+    --- Message templates (use %s for drug name, %d for quantity)
+    messageTemplates = {
+        'yo i need %d %s asap no cap',
+        'bro can u bring %d %s? ill be waiting',
+        'need a drop off... %d %s. pull up',
+        'got bread for %d %s come thru',
+        'u got %d %s? im tryna cop rn',
+        'its urgent fam %d %s bring it quick',
+        'slide thru w %d %s good money',
+        'need %d %s on the low. u kno the vibes',
+    },
+
+    --- Ped models for delivery contacts
+    pedModels = {
+        `a_m_y_stbla_01`,
+        `a_m_y_stbla_02`,
+        `a_m_y_mexthug_01`,
+        `a_m_m_stlat_02`,
+        `a_f_y_hipster_01`,
+        `a_m_y_skater_01`,
+        `g_m_y_famfor_01`,
+        `a_m_y_stwhi_02`,
+        `a_m_m_afriamer_01`,
+        `a_f_y_genhot_01`,
+    },
+
+    --- Vehicles that may be at the delivery point (nil = no vehicle)
+    vehicles = {
+        `emperor`,
+        `manana`,
+        `buccaneer`,
+        `tornado`,
+        `voodoo`,
+        `primo`,
+        `regina`,
+        `minivan`,
+        nil, nil, nil, -- weight toward no vehicle
+    },
+
+    --- Delivery locations across the map (vec4: x, y, z, heading)
+    deliveryLocations = {
+        -- South LS / Rancho / Strawberry
+        vec4(-63.0, -1778.0, 26.5, 135.0),
+        vec4(275.0, -1899.0, 26.0, 230.0),
+        vec4(342.0, -2055.0, 22.0, 320.0),
+        vec4(-118.0, -1657.0, 32.5, 45.0),
+        vec4(119.0, -1727.0, 29.5, 180.0),
+
+        -- Vespucci / Venice Beach
+        vec4(-1184.0, -1509.0, 4.5, 305.0),
+        vec4(-1298.0, -1162.0, 6.8, 110.0),
+        vec4(-1074.0, -1257.0, 6.5, 210.0),
+
+        -- Mirror Park / Vinewood
+        vec4(1035.0, -531.0, 57.5, 180.0),
+        vec4(953.0, -145.0, 74.0, 240.0),
+        vec4(304.0, -594.0, 43.3, 65.0),
+
+        -- Sandy Shores
+        vec4(1965.0, 3740.0, 32.0, 300.0),
+        vec4(1408.0, 3614.0, 35.0, 200.0),
+        vec4(1686.0, 4777.0, 42.0, 95.0),
+
+        -- Paleto Bay
+        vec4(-220.0, 6222.0, 31.5, 45.0),
+        vec4(164.0, 6638.0, 31.5, 250.0),
+
+        -- East LS / El Burro
+        vec4(1210.0, -1475.0, 35.0, 0.0),
+        vec4(987.0, -1800.0, 31.0, 270.0),
+        vec4(850.0, -2100.0, 30.0, 140.0),
+
+        -- Downtown / Pillbox
+        vec4(295.0, -885.0, 29.0, 160.0),
+        vec4(-290.0, -890.0, 31.0, 340.0),
+        vec4(60.0, -382.0, 39.5, 70.0),
+
+        -- Davis / Ballas territory
+        vec4(79.0, -1597.0, 29.5, 50.0),
+        vec4(-180.0, -1540.0, 35.0, 130.0),
+
+        -- Harmony / Route 68
+        vec4(544.0, 2670.0, 42.0, 185.0),
+        vec4(1182.0, 2645.0, 37.5, 270.0),
+
+        -- Cypress Flats / La Mesa
+        vec4(716.0, -1218.0, 26.0, 90.0),
+        vec4(823.0, -1022.0, 26.0, 0.0),
+
+        -- Del Perro / Pacific Bluffs
+        vec4(-1539.0, -395.0, 40.5, 235.0),
+        vec4(-1824.0, -639.0, 10.0, 140.0),
+    },
+}
+
 return Config
