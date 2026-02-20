@@ -279,70 +279,77 @@ local function runNegotiation(ped, data)
             return nil
         end
 
-        local currentOffer = offer.buyerOffer
-        local round = offer.round
-        local maxRounds = offer.maxRounds
+        local currentPrice = offer.buyerOffer
+        local currentQty = offer.quantity
+        local round = 0
+        local maxRounds = 2
         local accepted = nil
 
         while not accepted do
-            local headerText = ('**%s** wants %dx %s'):format(
-                archetype.label, offer.quantity, offer.itemLabel)
+            local headerText = ('**Buyer** wants %dx %s for $%s'):format(
+                currentQty, offer.itemLabel, lib.math.groupdigits(currentPrice))
 
             local options = {
                 {
-                    title = ('Accept $%s'):format(lib.math.groupdigits(currentOffer)),
-                    description = 'Take the offer',
+                    title = ('Accept $%s for %dx'):format(lib.math.groupdigits(currentPrice), currentQty),
+                    description = 'Take the deal',
                     icon = 'check',
                     onSelect = function()
-                        accepted = currentOffer
+                        accepted = currentPrice
                     end,
                 },
             }
 
-            if round <= maxRounds then
+            if round < maxRounds then
                 options[#options + 1] = {
                     title = 'Counter-offer',
-                    description = ('Round %d/%d — name your price'):format(round, maxRounds),
+                    description = ('Offer %d of %d — set your price & quantity'):format(round + 1, maxRounds),
                     icon = 'hand-holding-dollar',
                     onSelect = function()
                         local input = lib.inputDialog('Counter Offer', {
                             {
                                 type = 'number',
-                                label = ('Your price (fair ≈ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
+                                label = ('Your price (fair ~ $%s)'):format(lib.math.groupdigits(offer.fairPrice)),
                                 default = offer.fairPrice,
                                 min = 1,
-                                max = math.floor(offer.fairPrice * 2),
+                                max = math.floor(offer.fairPrice * 3),
+                            },
+                            {
+                                type = 'number',
+                                label = ('Quantity (they want %d)'):format(offer.quantity),
+                                default = currentQty,
+                                min = 1,
+                                max = offer.quantity,
                             },
                         })
 
                         if not input then accepted = -1 return end
 
-                        local result = lib.callback.await('free-trapsales:server:counterOffer', false, math.floor(input[1]))
+                        local counterPrice = math.floor(input[1])
+                        local counterQty = math.floor(input[2])
+
+                        local result = lib.callback.await('free-trapsales:server:counterOffer', false,
+                            counterPrice, counterQty)
 
                         if not result or result.error then accepted = -1 return end
 
                         if result.result == 'accepted' then
                             accepted = result.finalPrice
-                        elseif result.result == 'counter' then
-                            currentOffer = result.buyerOffer
-                            round = result.round
+                        elseif result.result == 'original' then
+                            -- Buyer insists on original deal
+                            currentPrice = result.originalPrice
+                            currentQty = result.originalQty
+                            round = round + 1
                             lib.notify({
                                 title = 'Negotiation',
-                                description = ('They counter with $%s'):format(lib.math.groupdigits(result.buyerOffer)),
-                                type = 'inform', duration = 3000,
-                            })
-                        elseif result.result == 'final_offer' then
-                            currentOffer = result.finalPrice
-                            round = maxRounds + 1
-                            lib.notify({
-                                title = 'Negotiation',
-                                description = ('Final offer: $%s — take it or leave it.'):format(lib.math.groupdigits(result.finalPrice)),
+                                description = ('They insist: $%s for %dx — take it or leave it.'):format(
+                                    lib.math.groupdigits(result.originalPrice), result.originalQty),
                                 type = 'warning', duration = 4000,
                             })
                         elseif result.result == 'walked_away' then
                             lib.notify({
                                 title = 'Drug Deal',
-                                description = 'They walked away. You pushed too hard.',
+                                description = 'They walked away.',
                                 type = 'error',
                             })
                             playSpeech(ped, archetype.speechAngry)
@@ -371,6 +378,7 @@ local function runNegotiation(ped, data)
             end
 
             if not accepted then
+                -- Menu was closed without selecting an option — treat as refuse
                 lib.callback.await('free-trapsales:server:refuseSale', false)
                 accepted = -1
             end
@@ -543,6 +551,63 @@ local function onInteractWithBuyer(ped)
 end
 
 -- ============================================================================
+-- DISCOVER EXISTING BUYER PEDS (from other clients)
+-- ============================================================================
+
+--- Scan nearby peds for drugBuyer statebag and register them locally.
+--- Returns how many existing buyers were found for the given zone.
+---@param zoneConfig DrugZoneConfig
+---@return integer count
+local function discoverExistingBuyers(zoneConfig)
+    local zoneCoords = zoneConfig.zone.coords
+    local radius = (zoneConfig.spawnRadius or 50.0) * 2.0
+    local discovered = 0
+
+    local pool = GetGamePool('CPed')
+    for _, ped in ipairs(pool) do
+        if buyerPeds[ped] then goto nextPed end -- already tracked
+        if not DoesEntityExist(ped) then goto nextPed end
+
+        local pedCoords = GetEntityCoords(ped)
+        if #(zoneCoords - pedCoords) > radius then goto nextPed end
+
+        local buyerData = Entity(ped).state.drugBuyer
+        if not buyerData then goto nextPed end
+        if buyerData.zoneId ~= zoneConfig.id then goto nextPed end
+
+        -- This ped was spawned by another client — register it locally
+        local groupPeds = {}
+        if buyerData.groupNetIds then
+            for _, netId in ipairs(buyerData.groupNetIds) do
+                if NetworkDoesNetworkIdExist(netId) then
+                    groupPeds[#groupPeds + 1] = NetToPed(netId)
+                end
+            end
+        end
+
+        buyerPeds[ped] = {
+            ped = ped,
+            groupPeds = groupPeds,
+            zoneId = buyerData.zoneId,
+            archetypeId = buyerData.archetypeId,
+            requestedItem = buyerData.requestedItem,
+            quantity = buyerData.quantity,
+            state = PedState.IDLE,
+            spawnTime = GetGameTimer(),
+            patienceExpiry = 0,
+            isOwner = false,
+        }
+
+        discovered = discovered + 1
+        lib.print.info(('[free-trapsales] Discovered existing buyer ped %d in zone %s'):format(ped, zoneConfig.id))
+
+        ::nextPed::
+    end
+
+    return discovered
+end
+
+-- ============================================================================
 -- SPAWN BUYER PED(S)
 -- ============================================================================
 
@@ -616,9 +681,38 @@ local function spawnBuyer(zoneConfig)
         state = PedState.IDLE,
         spawnTime = GetGameTimer(),
         patienceExpiry = 0,
+        isOwner = true,
     }
 
-    taskIdleScenario(leadPed, archetype)
+    -- Tag the ped with statebag data so other clients can discover it
+    local groupNetIds = {}
+    for _, gPed in ipairs(groupPeds) do
+        if DoesEntityExist(gPed) and NetworkGetEntityIsNetworked(gPed) then
+            groupNetIds[#groupNetIds + 1] = PedToNet(gPed)
+        end
+    end
+
+    Entity(leadPed).state:set('drugBuyer', {
+        zoneId = zoneConfig.id,
+        archetypeId = spawnData.archetypeId,
+        requestedItem = spawnData.requestedItem,
+        quantity = spawnData.quantity,
+        groupNetIds = groupNetIds,
+    }, true)
+
+    -- Walk towards the zone center so the ped looks natural (wanders in the area)
+    local zoneCenter = zoneConfig.zone.coords
+    ClearPedTasks(leadPed)
+    TaskWanderInArea(leadPed, zoneCenter.x, zoneCenter.y, zoneCenter.z, zoneConfig.approachRadius or 15.0, 1.0, 1.0)
+    SetPedKeepTask(leadPed, true)
+
+    -- Group members follow the lead ped
+    for _, gPed in ipairs(groupPeds) do
+        if DoesEntityExist(gPed) then
+            ClearPedTasks(gPed)
+            TaskFollowToOffsetOfEntity(gPed, leadPed, -1.0, -1.0, 0.0, 1.0, -1, 1.5, true)
+        end
+    end
 end
 
 -- ============================================================================
@@ -642,6 +736,16 @@ local function updateBuyers(zoneConfig)
         local pedCoords = GetEntityCoords(ped)
         local dist = #(playerCoords - pedCoords)
 
+        -- Non-owner clients: just track proximity so they can interact
+        if not data.isOwner then
+            if dist < zoneConfig.interactRadius and data.state ~= PedState.WAITING then
+                data.state = PedState.WAITING
+                data.patienceExpiry = GetGameTimer() + (archetype.patienceMs or 30000)
+            end
+            goto continue
+        end
+
+        -- Owner client: full behavior state machine
         if data.state == PedState.IDLE then
             if dist < zoneConfig.approachRadius then
                 data.state = PedState.APPROACHING
@@ -668,7 +772,7 @@ local function updateBuyers(zoneConfig)
 
                 lib.notify({
                     title = 'Drug Zone',
-                    description = ('A %s wants to talk...'):format(archetype.label:lower()),
+                    description = 'Someone wants to talk...',
                     type = 'inform', duration = 4000,
                 })
 
@@ -776,19 +880,24 @@ function InitDrugZones()
                     lib.print.info(('[free-trapsales] Entered drug zone: %s | Heat: %.1f | Rep: %.0f'):format(
                         config.label, state and state.heat or 0, state and state.reputation or 0))
 
-                    -- Initial spawns (staggered)
+                    -- Discover existing buyer peds spawned by other players first
+                    local existingCount = discoverExistingBuyers(config)
+                    lib.print.info(('[free-trapsales] Discovered %d existing buyer peds in zone %s'):format(existingCount, zoneId))
+
+                    -- Initial spawns (staggered) — only spawn enough to fill the gap
                     CreateThread(function()
                         local todMult = getTimeOfDayMultiplier()
-                        lib.print.info(('[free-trapsales] Starting initial spawns for %s | maxPeds=%d | todMult=%.2f'):format(
-                            zoneId, config.maxPeds, todMult))
+                        local toSpawn = config.maxPeds - existingCount
+                        lib.print.info(('[free-trapsales] Starting initial spawns for %s | maxPeds=%d | existing=%d | toSpawn=%d | todMult=%.2f'):format(
+                            zoneId, config.maxPeds, existingCount, toSpawn, todMult))
 
-                        for i = 1, config.maxPeds do
+                        for i = 1, toSpawn do
                             if not zoneActive[zoneId] then return end
                             if math.random() < todMult then
-                                lib.print.info(('[free-trapsales] Spawning buyer %d/%d in %s'):format(i, config.maxPeds, zoneId))
+                                lib.print.info(('[free-trapsales] Spawning buyer %d/%d in %s'):format(i, toSpawn, zoneId))
                                 spawnBuyer(config)
                             else
-                                lib.print.info(('[free-trapsales] Skipped buyer %d/%d (todMult roll failed)'):format(i, config.maxPeds))
+                                lib.print.info(('[free-trapsales] Skipped buyer %d/%d (todMult roll failed)'):format(i, toSpawn))
                             end
                             Wait(math.random(800, 1500))
                         end
@@ -807,6 +916,9 @@ function InitDrugZones()
                         while zoneActive[zoneId] do
                             Wait(config.cooldownPerPedMs)
                             if not zoneActive[zoneId] then return end
+
+                            -- Re-discover any peds from other clients
+                            discoverExistingBuyers(config)
 
                             local count = 0
                             for _, d in pairs(buyerPeds) do
@@ -948,7 +1060,8 @@ local function findVehicleSpawnNode(zoneCoords, spawnDistance)
     return nil, nil
 end
 
---- Find a road node near the zone center for parking
+--- Find a road-side parking spot near the zone center.
+--- Uses GetPointOnRoadSide to place vehicles at the curb rather than in traffic lanes.
 ---@param zoneCoords vector3
 ---@param parkDistance number
 ---@return vector3?, number?
@@ -959,6 +1072,16 @@ local function findParkingNode(zoneCoords, parkDistance)
         local x = zoneCoords.x + math.cos(angle) * dist
         local y = zoneCoords.y + math.sin(angle) * dist
 
+        -- Try to get a road-side position (curb) first
+        local sideFound, sidePos = GetPointOnRoadSide(x, y, zoneCoords.z, 0)
+        if sideFound then
+            -- Get the nearest vehicle node heading so the car parks aligned with the road
+            local headingFound, _, heading = GetClosestVehicleNodeWithHeading(sidePos.x, sidePos.y, sidePos.z, 1, 3.0, 0)
+            local parkHeading = headingFound and heading or 0.0
+            return vec3(sidePos.x, sidePos.y, sidePos.z), parkHeading
+        end
+
+        -- Fallback to standard vehicle node
         local found, nodePos, heading = GetClosestVehicleNodeWithHeading(x, y, zoneCoords.z, 1, 3.0, 0)
         if found then
             return vec3(nodePos.x, nodePos.y, nodePos.z), heading
@@ -1026,7 +1149,7 @@ local function vehicleDriveAwayAndCleanup(driverPed)
     SetVehicleHandbrake(vehicle, false)
     ClearPedTasks(driverPed)
     SetBlockingOfNonTemporaryEvents(driverPed, true)
-    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 786603)
+    TaskVehicleDriveWander(driverPed, vehicle, 25.0, 262669)
 
     -- Delayed cleanup
     SetTimeout(20000, function()
@@ -1372,8 +1495,10 @@ local function startVehicleBuyerBehavior(driverPed, zoneConfig)
     end
 
     -- Phase 1: Drive to parking spot
+    -- Driving style 262144 + 512 + 8 + 4 + 2 + 1 = 262669
+    -- Obey traffic lights, stop before vehicles, avoid empty vehicles, take shortest path
     data.state = VehicleState.DRIVING_IN
-    TaskVehicleDriveToCoordLongrange(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, 18.0, 786603, 5.0)
+    TaskVehicleDriveToCoordLongrange(driverPed, vehicle, parkPos.x, parkPos.y, parkPos.z, 15.0, 262669, 5.0)
 
     -- Wait for arrival
     local arrivalTimeout = GetGameTimer() + 30000
@@ -1498,7 +1623,7 @@ spawnVehicleBuyer = function(zoneConfig)
     local vehicleModel = PickRandom(archetype.vehicles)
     if not RequestModelAsync(vehicleModel, 5000) then return end
 
-    local vehicle = CreateVehicle(vehicleModel, spawnPos.x, spawnPos.y, spawnPos.z, spawnHeading or 0.0, false, true)
+    local vehicle = CreateVehicle(vehicleModel, spawnPos.x, spawnPos.y, spawnPos.z, spawnHeading or 0.0, true, true)
     if not DoesEntityExist(vehicle) then
         SetModelAsNoLongerNeeded(vehicleModel)
         return

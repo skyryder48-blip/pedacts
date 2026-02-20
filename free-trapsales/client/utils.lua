@@ -38,11 +38,19 @@ function SpawnScenarioPed(modelHash, coords, heading, zoneId)
     if not RequestModelAsync(modelHash) then return nil end
 
     heading = heading or (coords.w and coords.w or 0.0)
-    local ped = CreatePed(4, modelHash, coords.x, coords.y, coords.z, heading, false, true)
+    -- isNetwork=true so all players can see the ped; scriptHosted=true so this client controls it
+    local ped = CreatePed(4, modelHash, coords.x, coords.y, coords.z, heading, true, true)
 
     if not DoesEntityExist(ped) then
         SetModelAsNoLongerNeeded(modelHash)
         return nil
+    end
+
+    -- Ensure this client owns the ped on the network
+    local netTimeout = 0
+    while not NetworkGetEntityIsNetworked(ped) and netTimeout < 10 do
+        Wait(100)
+        netTimeout = netTimeout + 1
     end
 
     -- Core setup: no-despawn, freeze AI defaults
